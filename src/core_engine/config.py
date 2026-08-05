@@ -18,6 +18,9 @@ class DedupConfig:
     time_window_minutes: int = 30
     # Tightened from the PRD's 10 to reduce false-merge risk on text-dense images [H1].
     hamming_threshold: int = 8
+    # Near-exact threshold applied when either candidate is text-heavy
+    # (screenshots/documents), so distinct text images are not merged [H1].
+    text_hamming_threshold: int = 2
 
 
 @dataclass
@@ -61,6 +64,9 @@ class Config:
             gps_radius_meters=float(d.get("gps_radius_meters", DedupConfig.gps_radius_meters)),
             time_window_minutes=int(d.get("time_window_minutes", DedupConfig.time_window_minutes)),
             hamming_threshold=int(d.get("hamming_threshold", DedupConfig.hamming_threshold)),
+            text_hamming_threshold=int(
+                d.get("text_hamming_threshold", DedupConfig.text_hamming_threshold)
+            ),
         )
 
         dl = data.get("delta", {})

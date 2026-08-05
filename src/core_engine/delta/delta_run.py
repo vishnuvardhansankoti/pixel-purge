@@ -115,6 +115,7 @@ def delta_run(
             gps_radius_m=config.dedup.gps_radius_meters,
             time_window_min=config.dedup.time_window_minutes,
             hamming_threshold=config.dedup.hamming_threshold,
+            text_hamming_threshold=config.dedup.text_hamming_threshold,
         )
 
     items = db.get_items_for_delta()

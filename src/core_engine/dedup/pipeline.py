@@ -29,6 +29,7 @@ def run_dedup(
     gps_radius_m: float = 100.0,
     time_window_min: int = 30,
     hamming_threshold: int = 8,
+    text_hamming_threshold: int = 2,
     tiers: tuple[int, ...] = (1, 2, 3),
 ) -> dict[str, int]:
     """Run the requested dedup tiers. Tier 3 depends on Tier 2 buckets."""
@@ -42,6 +43,9 @@ def run_dedup(
         buckets = run_tier2(db, gps_radius_m, time_window_min)
 
     if 3 in tiers:
-        flagged_t3 = run_tier3(db, buckets, hamming_threshold=hamming_threshold)
+        flagged_t3 = run_tier3(
+            db, buckets, hamming_threshold=hamming_threshold,
+            text_hamming_threshold=text_hamming_threshold,
+        )
 
     return {"exact_flagged": flagged_t1, "visual_flagged": flagged_t3}

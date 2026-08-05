@@ -73,6 +73,8 @@ def dedup(
     gps_radius: float = typer.Option(None, help="GPS bucket radius in meters"),
     time_window: int = typer.Option(None, help="Temporal session window in minutes"),
     hamming_threshold: int = typer.Option(None, help="Max pHash Hamming distance for a match"),
+    text_hamming_threshold: int = typer.Option(
+        None, help="Stricter Hamming distance for text-heavy images (screenshots/docs)"),
     tier: Optional[int] = typer.Option(None, help="Run a single tier only (1, 2, or 3)"),
     stats: bool = typer.Option(False, "--stats", help="Show dedup statistics and exit"),
 ) -> None:
@@ -86,6 +88,10 @@ def dedup(
     hamming_threshold = (
         hamming_threshold if hamming_threshold is not None else d.hamming_threshold
     )
+    text_hamming_threshold = (
+        text_hamming_threshold if text_hamming_threshold is not None
+        else d.text_hamming_threshold
+    )
     tiers = (tier,) if tier else (1, 2, 3)
 
     with Database(cfg.db_path) as db:
@@ -98,6 +104,7 @@ def dedup(
             gps_radius_m=gps_radius,
             time_window_min=time_window,
             hamming_threshold=hamming_threshold,
+            text_hamming_threshold=text_hamming_threshold,
             tiers=tiers,
         )
         _print_stats(db)
