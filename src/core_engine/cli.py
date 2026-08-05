@@ -218,6 +218,44 @@ def _print_delta_stats(db: Database) -> None:
     console.print(table)
 
 
+@app.command("eval")
+def eval_cmd(
+    manifest: Path = typer.Argument(..., help="Labeled-set CSV with columns: path,bucket"),
+    device: str = typer.Option("auto", help="Torch device: auto, mps, cpu"),
+    target: float = typer.Option(0.90, help="Accuracy target to check against"),
+) -> None:
+    """Measure vision classifier accuracy against a labeled set (path,bucket CSV) [H2]."""
+    from .vision.eval import evaluate, load_eval_manifest, make_clip_classify_fn
+    from .vision.taxonomy import BUCKETS
+
+    cases = load_eval_manifest(manifest)
+    metrics = evaluate(cases, make_clip_classify_fn(device=device))
+
+    # Confusion matrix (rows = expected, cols = predicted)
+    ct = Table(title="Confusion Matrix (row=expected, col=predicted)")
+    ct.add_column("expected \\ predicted")
+    for b in BUCKETS:
+        ct.add_column(b, justify="right")
+    for e in BUCKETS:
+        ct.add_row(e, *[str(metrics.confusion[e][p]) for p in BUCKETS])
+    console.print(ct)
+
+    mt = Table(title="Per-bucket metrics")
+    for col in ("bucket", "precision", "recall", "f1", "support"):
+        mt.add_column(col, justify="right" if col != "bucket" else "left")
+    for b in BUCKETS:
+        m = metrics.per_bucket[b]
+        mt.add_row(b, f"{m['precision']:.2f}", f"{m['recall']:.2f}",
+                   f"{m['f1']:.2f}", str(int(m["support"])))
+    console.print(mt)
+
+    ok = metrics.accuracy >= target
+    color = "green" if ok else "red"
+    console.print(f"[{color}]Overall accuracy: {metrics.accuracy:.1%}[/{color}] "
+                  f"({metrics.correct}/{metrics.total}); target {target:.0%} "
+                  f"{'met ✅' if ok else 'not met ❌'}")
+
+
 @app.command()
 def review(
     batch_size: int = typer.Option(20, help="Items shown per review batch"),
