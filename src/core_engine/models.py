@@ -1,0 +1,78 @@
+"""Data models for the manifest (plain dataclasses, no ORM)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from typing import Any
+
+
+@dataclass
+class MediaRecord:
+    """A single media item as tracked in the ``media_items`` table.
+
+    Only the columns Phase 1 reads/writes are represented as first-class
+    fields; the row round-trips through the DB by column name.
+    """
+
+    filename: str
+    local_path: str
+    file_size: int
+    media_type: str  # 'PHOTO' | 'VIDEO'
+
+    id: int | None = None
+
+    # Timestamps (Unix epoch, seconds)
+    taken_timestamp: int | None = None
+    creation_timestamp: int | None = None
+
+    # Geolocation
+    latitude: float | None = None
+    longitude: float | None = None
+
+    # Sidecar metadata
+    user_description: str | None = None
+    original_title: str | None = None
+    view_count: int | None = None
+
+    # Dedup
+    sha256_hash: str | None = None
+    phash: str | None = None
+    phash_cluster_id: int | None = None
+    is_duplicate: int = 0
+    duplicate_of: int | None = None
+    dedup_tier: str | None = None
+    hamming_distance: int | None = None
+
+    # Video
+    keyframe_path: str | None = None
+    duration_seconds: float | None = None
+
+    # Status
+    ingestion_status: str = "PENDING"
+    keeper_status: str = "PENDING"
+    error_message: str | None = None
+
+    @property
+    def visual_path(self) -> str:
+        """Path used for visual analysis (video keyframe if present)."""
+        return self.keyframe_path or self.local_path
+
+    @property
+    def metadata_richness(self) -> int:
+        """Count of non-null 'valuable' metadata fields — used for keeper choice [M4]."""
+        candidates = (
+            self.taken_timestamp,
+            self.latitude,
+            self.longitude,
+            self.user_description,
+            self.original_title,
+            self.view_count,
+        )
+        return sum(1 for c in candidates if c not in (None, ""))
+
+    @classmethod
+    def from_row(cls, row: Any) -> "MediaRecord":
+        """Build a MediaRecord from a sqlite3.Row (extra columns ignored)."""
+        known = {f.name for f in fields(cls)}
+        data = {k: row[k] for k in row.keys() if k in known}
+        return cls(**data)

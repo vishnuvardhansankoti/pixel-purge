@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Pixel Purge runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+.pixel-purge-extracted/
+*_keyframe.jpg
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
