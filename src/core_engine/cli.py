@@ -103,6 +103,61 @@ def dedup(
         _print_stats(db)
 
 
+@app.command()
+def classify(
+    vision_only: bool = typer.Option(False, "--vision-only", help="Run CLIP vision only"),
+    faces_only: bool = typer.Option(False, "--faces-only", help="Run face clustering only"),
+    device: str = typer.Option("auto", help="Torch device: auto, mps, cpu"),
+    eps: float = typer.Option(0.45, help="DBSCAN eps (cosine) for face clustering"),
+    min_samples: int = typer.Option(2, help="DBSCAN min_samples for face clustering"),
+    stats: bool = typer.Option(False, "--stats", help="Show classification stats and exit"),
+) -> None:
+    """Module C: local CLIP vision tagging + InsightFace clustering."""
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+        if stats:
+            _print_classify_stats(db)
+            return
+
+        run_vision = not faces_only
+        run_faces = not vision_only
+        if run_vision:
+            from .vision.clip_tagger import run_vision as _run_vision
+
+            _run_vision(db, device=device)
+        if run_faces:
+            from .vision.faces import run_face_clustering
+
+            run_face_clustering(db, eps=eps, min_samples=min_samples)
+        _print_classify_stats(db)
+
+
+@app.command()
+def review(
+    batch_size: int = typer.Option(20, help="Items shown per review batch"),
+) -> None:
+    """Interactively review flagged duplicates + purge candidates (approve/reject)."""
+    from .tui import review as run_review
+
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+        run_review(db, batch_size=batch_size)
+
+
+def _print_classify_stats(db: Database) -> None:
+    v = db.vision_stats()
+    f = db.face_cluster_stats()
+    table = Table(title="Classification Statistics", show_header=False)
+    for bucket in ("ADHOC_PURGE", "TRIP", "FAMILY_KEEP", "OTHER"):
+        table.add_row(bucket, str(v.get(bucket, 0)))
+    table.add_row("Faces detected", str(f["faces"]))
+    table.add_row("People (clusters)", str(f["clusters"]))
+    table.add_row("Unclustered faces", str(f["unclustered"]))
+    console.print(table)
+
+
 def _print_stats(db: Database) -> None:
     s = db.dedup_stats()
     reclaimable_mb = (s["reclaimable_bytes"] or 0) / (1024 * 1024)

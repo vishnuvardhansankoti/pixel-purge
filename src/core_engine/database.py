@@ -169,7 +169,140 @@ class Database:
             (duplicate_of, dedup_tier, hamming_distance, dupe_id),
         )
 
+    # ---- Module C: vision ------------------------------------------------
+    def get_items_for_vision(self) -> list[MediaRecord]:
+        """Non-duplicate items still needing vision classification (resume-safe)."""
+        return self._query_records(
+            "SELECT * FROM media_items "
+            "WHERE is_duplicate = 0 AND vision_status = 'PENDING' "
+            "AND ingestion_status = 'COMPLETE'"
+        )
+
+    def update_vision(
+        self,
+        item_id: int,
+        *,
+        ai_caption: str | None,
+        ai_label: str | None,
+        blur_score: float | None,
+        ocr_text_ratio: float | None,
+        bucket: str | None,
+        confidence: float | None,
+        reasoning: str | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE media_items
+            SET ai_caption = ?, ai_label = ?, blur_score = ?, ocr_text_ratio = ?,
+                classification_bucket = ?, classification_confidence = ?,
+                classification_reasoning = ?, vision_status = 'COMPLETE',
+                updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (ai_caption, ai_label, blur_score, ocr_text_ratio,
+             bucket, confidence, reasoning, item_id),
+        )
+
+    def mark_vision_error(self, item_id: int, message: str) -> None:
+        self.conn.execute(
+            "UPDATE media_items SET vision_status = 'ERROR', error_message = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (message[:500], item_id),
+        )
+
+    # ---- Module C: faces -------------------------------------------------
+    def get_items_for_faces(self) -> list[MediaRecord]:
+        return self._query_records(
+            "SELECT * FROM media_items "
+            "WHERE is_duplicate = 0 AND face_status = 'PENDING' "
+            "AND ingestion_status = 'COMPLETE'"
+        )
+
+    def mark_faces_done(
+        self, item_id: int, face_count: int, error: str | None = None
+    ) -> None:
+        status = "ERROR" if error else "COMPLETE"
+        self.conn.execute(
+            "UPDATE media_items SET face_count = ?, face_status = ?, "
+            "error_message = COALESCE(?, error_message), updated_at = datetime('now') "
+            "WHERE id = ?",
+            (face_count, status, error[:500] if error else None, item_id),
+        )
+
+    def add_face_embedding(
+        self,
+        media_item_id: int,
+        face_index: int,
+        embedding: bytes,
+        bbox: tuple[int, int, int, int] | None = None,
+    ) -> int:
+        top, right, bottom, left = bbox or (None, None, None, None)
+        cur = self.conn.execute(
+            "INSERT OR REPLACE INTO face_embeddings "
+            "(media_item_id, face_index, embedding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (media_item_id, face_index, embedding, top, right, bottom, left),
+        )
+        return cur.lastrowid
+
+    def get_all_face_embeddings(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, media_item_id, face_index, person_cluster_id, embedding "
+            "FROM face_embeddings ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_face_cluster(self, embedding_id: int, person_cluster_id: str | None) -> None:
+        self.conn.execute(
+            "UPDATE face_embeddings SET person_cluster_id = ? WHERE id = ?",
+            (person_cluster_id, embedding_id),
+        )
+
+    def set_person_cluster_ids(self, media_item_id: int, cluster_ids_json: str) -> None:
+        self.conn.execute(
+            "UPDATE media_items SET person_cluster_ids = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (cluster_ids_json, media_item_id),
+        )
+
+    # ---- review ----------------------------------------------------------
+    def get_items_for_review(self) -> list[MediaRecord]:
+        """Items needing a human decision: dedup duplicates flagged REVIEW, plus
+        vision purge candidates — excluding anything already resolved KEEP/DELETE."""
+        return self._query_records(
+            "SELECT * FROM media_items "
+            "WHERE keeper_status NOT IN ('KEEP', 'DELETE') "
+            "AND (keeper_status = 'REVIEW' OR classification_bucket = 'ADHOC_PURGE') "
+            "ORDER BY id"
+        )
+
+    def set_keeper_status(self, item_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE media_items SET keeper_status = ?, updated_at = datetime('now') WHERE id = ?",
+            (status, item_id),
+        )
+
     # ---- stats -----------------------------------------------------------
+    def vision_stats(self) -> dict:
+        rows = self.conn.execute(
+            "SELECT classification_bucket AS bucket, COUNT(*) AS c FROM media_items "
+            "WHERE classification_bucket IS NOT NULL GROUP BY classification_bucket"
+        ).fetchall()
+        return {r["bucket"]: r["c"] for r in rows}
+
+    def face_cluster_stats(self) -> dict:
+        total = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM face_embeddings"
+        ).fetchone()["c"]
+        clusters = self.conn.execute(
+            "SELECT COUNT(DISTINCT person_cluster_id) AS c FROM face_embeddings "
+            "WHERE person_cluster_id IS NOT NULL"
+        ).fetchone()["c"]
+        noise = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM face_embeddings WHERE person_cluster_id IS NULL"
+        ).fetchone()["c"]
+        return {"faces": total, "clusters": clusters, "unclustered": noise}
+
     def dedup_stats(self) -> dict:
         row = self.conn.execute(
             """

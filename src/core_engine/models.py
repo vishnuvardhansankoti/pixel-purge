@@ -43,12 +43,27 @@ class MediaRecord:
     dedup_tier: str | None = None
     hamming_distance: int | None = None
 
+    # Module C: vision
+    ai_caption: str | None = None
+    ai_label: str | None = None
+    blur_score: float | None = None
+    ocr_text_ratio: float | None = None
+    face_count: int = 0
+    person_cluster_ids: str | None = None  # JSON array of cluster ids
+
+    # Module C/E: classification
+    classification_bucket: str | None = None
+    classification_confidence: float | None = None
+    classification_reasoning: str | None = None
+
     # Video
     keyframe_path: str | None = None
     duration_seconds: float | None = None
 
     # Status
     ingestion_status: str = "PENDING"
+    vision_status: str = "PENDING"
+    face_status: str = "PENDING"
     keeper_status: str = "PENDING"
     error_message: str | None = None
 
