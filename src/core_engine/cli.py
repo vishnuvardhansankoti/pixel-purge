@@ -170,6 +170,30 @@ def schedule(
     console.print(load_hint(plist))
 
 
+@app.command()
+def dashboard(
+    port: int = typer.Option(8787, help="Port to serve on"),
+    host: str = typer.Option("127.0.0.1", help="Bind address (localhost only by default)"),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not open the browser"),
+) -> None:
+    """Launch the local dashboard (Review / Dedup / Faces) at http://localhost:PORT."""
+    import webbrowser
+
+    import uvicorn
+
+    from .dashboard import create_app
+
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+    app_ = create_app(cfg.db_path)
+    url = f"http://{host}:{port}"
+    console.print(f"[green]Pixel Purge dashboard[/green] → {url}  (Ctrl+C to stop)")
+    if not no_open:
+        webbrowser.open(url)
+    uvicorn.run(app_, host=host, port=port, log_level="warning")
+
+
 def _notify(message: str) -> None:
     """Best-effort macOS notification; silently no-op elsewhere."""
     import shutil

@@ -9,6 +9,7 @@ No cloud hosting — everything runs on your machine. See [`docs/pixel-purge-prd
 - **Phase 2** (done): local AI vision (CLIP zero-shot) + face clustering (InsightFace/DBSCAN) + TUI review.
 - **Phase 3** (done): cleanup execution — deletion-manifest export (primary), curation + staging with format-aware metadata restore, gated clean-slate re-upload, experimental browser deletion.
 - **Phase 4** (done): local monthly delta classifier (`delta`) — reuses ingest+dedup, CLIP classification with GPS→TRIP override, watermark idempotency, launchd scheduling.
+- **Phase 5** (done): local dashboard (`dashboard`) — FastAPI on localhost serving a zero-build UI with Review / Dedup / Faces views and on-disk thumbnails.
 
 ## Install
 
@@ -50,7 +51,15 @@ pixel-purge delta ~/Downloads/takeout-2026-08.tgz   # classify new photos (month
 pixel-purge delta ... --dry-run            # report new items only
 pixel-purge delta --stats                  # per-bucket counts + watermark
 pixel-purge schedule ~/Downloads/Takeout   # install monthly launchd agent (macOS)
+
+pixel-purge dashboard                       # local UI at http://localhost:8787
 ```
+
+The dashboard is a local FastAPI server (needs the `[dashboard]` extra:
+`pip install -e '.[dashboard]'`) serving a zero-build HTML/JS UI — no Node
+toolchain. It reads the manifest directly and streams thumbnails from disk, so it
+must run on the same machine as the library. Bound to `localhost`; the OS user is
+the security boundary.
 
 Cleanup never deletes via the API (Google removed those scopes and never
 supported media deletion). The default `cleanup` writes a reviewable deletion

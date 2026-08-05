@@ -349,6 +349,63 @@ class Database:
         ).fetchone()
         return dict(row)
 
+    # ---- Module F: dashboard --------------------------------------------
+    def get_dedup_clusters(self) -> list[dict]:
+        """Group duplicates under their keeper. Returns [{keeper, members[]}]."""
+        keeper_ids = [
+            r["duplicate_of"]
+            for r in self.conn.execute(
+                "SELECT DISTINCT duplicate_of FROM media_items "
+                "WHERE is_duplicate = 1 AND duplicate_of IS NOT NULL"
+            ).fetchall()
+        ]
+        clusters = []
+        for kid in keeper_ids:
+            keeper = self.get_item(kid)
+            if keeper is None:
+                continue
+            members = self._query_records(
+                "SELECT * FROM media_items WHERE duplicate_of = ? ORDER BY id", (kid,)
+            )
+            clusters.append({"keeper": keeper, "members": members})
+        return clusters
+
+    def get_face_clusters(self) -> list[dict]:
+        """One row per person cluster: id, face count, a representative media item."""
+        rows = self.conn.execute(
+            "SELECT person_cluster_id AS cid, COUNT(*) AS n, MIN(media_item_id) AS rep "
+            "FROM face_embeddings WHERE person_cluster_id IS NOT NULL "
+            "GROUP BY person_cluster_id ORDER BY n DESC"
+        ).fetchall()
+        return [
+            {"cluster_id": r["cid"], "count": r["n"], "representative_item_id": r["rep"],
+             "name": self.get_face_name(r["cid"])}
+            for r in rows
+        ]
+
+    def get_face_cluster_items(self, cluster_id: str) -> list[MediaRecord]:
+        return self._query_records(
+            "SELECT m.* FROM media_items m "
+            "JOIN face_embeddings f ON f.media_item_id = m.id "
+            "WHERE f.person_cluster_id = ? GROUP BY m.id ORDER BY m.id",
+            (cluster_id,),
+        )
+
+    def get_face_name(self, cluster_id: str) -> str | None:
+        return self.get_state(f"face_name:{cluster_id}")
+
+    def set_face_name(self, cluster_id: str, name: str) -> None:
+        self.set_state(f"face_name:{cluster_id}", name)
+
+    def merge_face_clusters(self, source_id: str, target_id: str) -> int:
+        """Reassign all faces from source cluster into target. Returns rows moved."""
+        cur = self.conn.execute(
+            "UPDATE face_embeddings SET person_cluster_id = ? WHERE person_cluster_id = ?",
+            (target_id, source_id),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     # ---- stats -----------------------------------------------------------
     def vision_stats(self) -> dict:
         rows = self.conn.execute(

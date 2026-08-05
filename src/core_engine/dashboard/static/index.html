@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Purge Dashboard</title>
+<style>
+  :root { --bg:#0f0f23; --panel:#1a1a2e; --panel2:#22223a; --fg:#e8e8f0;
+          --muted:#9a9ab0; --accent:#6366f1; --green:#22c55e; --red:#ef4444;
+          --yellow:#eab308; --border:#2e2e48; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border);
+           display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  .stats { display:flex; gap:16px; color:var(--muted); font-size:13px; flex-wrap:wrap; }
+  .stats b { color:var(--fg); }
+  nav { display:flex; gap:4px; padding:12px 24px 0; }
+  nav button, .filters button { background:var(--panel); color:var(--muted);
+    border:1px solid var(--border); padding:8px 16px; border-radius:8px 8px 0 0;
+    cursor:pointer; font-size:14px; }
+  nav button.active { background:var(--panel2); color:var(--fg); border-bottom-color:var(--panel2); }
+  main { padding:20px 24px; }
+  .filters { display:flex; gap:8px; margin-bottom:16px; }
+  .filters button { border-radius:999px; padding:6px 14px; }
+  .filters button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+          overflow:hidden; display:flex; flex-direction:column; }
+  .card img { width:100%; height:150px; object-fit:cover; background:var(--panel2); display:block; }
+  .card .body { padding:8px 10px; display:flex; flex-direction:column; gap:6px; }
+  .fn { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden;
+        text-overflow:ellipsis; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+           font-weight:600; }
+  .b-ADHOC_PURGE{background:#7f1d1d;color:#fecaca} .b-TRIP{background:#164e63;color:#a5f3fc}
+  .b-FAMILY_KEEP{background:#14532d;color:#bbf7d0} .b-OTHER{background:#374151;color:#d1d5db}
+  .conf-hi{color:var(--green)} .conf-mid{color:var(--yellow)} .conf-lo{color:var(--red)}
+  .row { display:flex; gap:6px; }
+  .row button { flex:1; border:none; border-radius:6px; padding:6px; cursor:pointer;
+                font-size:12px; font-weight:600; }
+  .keep { background:#14532d; color:#bbf7d0; } .del { background:#7f1d1d; color:#fecaca; }
+  .keep.on { outline:2px solid var(--green); } .del.on { outline:2px solid var(--red); }
+  .cluster { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+             padding:12px; margin-bottom:14px; }
+  .cluster h3 { margin:0 0 8px; font-size:13px; color:var(--muted); font-weight:600; }
+  .thumbs { display:flex; gap:10px; flex-wrap:wrap; }
+  .thumbs figure { margin:0; width:130px; }
+  .thumbs img { width:130px; height:110px; object-fit:cover; border-radius:8px;
+                border:2px solid transparent; }
+  .thumbs .keeper img { border-color:var(--green); }
+  .thumbs figcaption { font-size:11px; color:var(--muted); margin-top:4px; }
+  .muted { color:var(--muted); } .empty { color:var(--muted); padding:40px; text-align:center; }
+  input.name { background:var(--panel2); border:1px solid var(--border); color:var(--fg);
+               border-radius:6px; padding:4px 8px; width:100%; font-size:12px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧹 Pixel Purge</h1>
+  <div class="stats" id="stats">loading…</div>
+</header>
+<nav>
+  <button data-tab="review" class="active">Review</button>
+  <button data-tab="dedup">Dedup</button>
+  <button data-tab="faces">Faces</button>
+</nav>
+<main id="main"></main>
+
+<script>
+const $ = (s,el=document)=>el.querySelector(s);
+const api = (u,opts)=>fetch(u,opts).then(r=>r.json());
+let filter = 'ALL';
+
+function confClass(c){ return c==null?'':c>0.9?'conf-hi':c>=0.7?'conf-mid':'conf-lo'; }
+function fmtBytes(b){ return b>1e6?(b/1e6).toFixed(1)+' MB':(b/1e3).toFixed(0)+' KB'; }
+
+async function loadStats(){
+  const s = await api('/api/summary');
+  $('#stats').innerHTML =
+    `<span>Total <b>${s.dedup.total||0}</b></span>`+
+    `<span>Duplicates <b>${s.dedup.duplicates||0}</b></span>`+
+    `<span>To delete <b>${s.cleanup.to_delete||0}</b></span>`+
+    `<span>People <b>${s.faces.clusters||0}</b></span>`;
+}
+
+async function renderReview(){
+  const main = $('#main');
+  const buckets = ['ALL','ADHOC_PURGE','TRIP','FAMILY_KEEP','OTHER'];
+  main.innerHTML = `<div class="filters">`+
+    buckets.map(b=>`<button data-b="${b}" class="${b===filter?'active':''}">${b}</button>`).join('')+
+    `</div><div class="grid" id="rgrid"></div>`;
+  main.querySelectorAll('.filters button').forEach(btn=>btn.onclick=()=>{filter=btn.dataset.b;renderReview();});
+  const {items} = await api('/api/review?bucket='+encodeURIComponent(filter));
+  const grid = $('#rgrid');
+  if(!items.length){ grid.innerHTML='<div class="empty">Nothing to review 🎉</div>'; return; }
+  grid.innerHTML = items.map(it=>`
+    <div class="card" data-id="${it.id}">
+      <img loading="lazy" src="${it.thumb}?size=256" onerror="this.style.opacity=.3">
+      <div class="body">
+        <span class="fn" title="${it.filename}">${it.filename}</span>
+        <div>${it.classification_bucket?`<span class="badge b-${it.classification_bucket}">${it.classification_bucket}</span>`:''}
+          ${it.classification_confidence!=null?`<span class="${confClass(it.classification_confidence)}"> ${(it.classification_confidence*100).toFixed(0)}%</span>`:''}</div>
+        <span class="fn" title="${(it.classification_reasoning||it.dedup_tier||'')}">${it.classification_reasoning||it.dedup_tier||''}</span>
+        <div class="row">
+          <button class="keep ${it.keeper_status==='KEEP'?'on':''}" data-a="KEEP">Keep</button>
+          <button class="del ${it.keeper_status==='DELETE'?'on':''}" data-a="DELETE">Delete</button>
+        </div>
+      </div>
+    </div>`).join('');
+  grid.querySelectorAll('.card').forEach(card=>{
+    card.querySelectorAll('button[data-a]').forEach(b=>b.onclick=async()=>{
+      await api(`/api/items/${card.dataset.id}/status`,{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({status:b.dataset.a})});
+      card.querySelector('.keep').classList.toggle('on',b.dataset.a==='KEEP');
+      card.querySelector('.del').classList.toggle('on',b.dataset.a==='DELETE');
+      loadStats();
+    });
+  });
+}
+
+async function renderDedup(){
+  const {clusters} = await api('/api/dedup');
+  $('#main').innerHTML = clusters.length? clusters.map(c=>`
+    <div class="cluster">
+      <h3>${c.members.length+1} items · ${c.members[0]?.dedup_tier||''} · saves ${fmtBytes(c.savings_bytes)}</h3>
+      <div class="thumbs">
+        <figure class="keeper"><img src="${c.keeper.thumb}?size=200"><figcaption>★ keeper · ${c.keeper.filename}</figcaption></figure>
+        ${c.members.map(m=>`<figure><img src="${m.thumb}?size=200"><figcaption>${m.filename}${m.hamming_distance!=null?` · d=${m.hamming_distance}`:''}</figcaption></figure>`).join('')}
+      </div>
+    </div>`).join('') : '<div class="empty">No duplicate clusters.</div>';
+}
+
+async function renderFaces(){
+  const {clusters} = await api('/api/faces');
+  $('#main').innerHTML = clusters.length? `<div class="grid">`+clusters.map(c=>`
+    <div class="card" data-cid="${c.cluster_id}">
+      <img src="${c.thumb}?size=256">
+      <div class="body">
+        <span class="fn">${c.count} photo(s)</span>
+        <input class="name" value="${c.name||''}" placeholder="name this person…">
+      </div>
+    </div>`).join('')+`</div>` : '<div class="empty">No face clusters. Run <code>classify --faces-only</code>.</div>';
+  document.querySelectorAll('.card[data-cid]').forEach(card=>{
+    const inp = card.querySelector('input.name');
+    inp.onchange = ()=>api(`/api/faces/${card.dataset.cid}/name`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({name:inp.value})});
+  });
+}
+
+const tabs = {review:renderReview, dedup:renderDedup, faces:renderFaces};
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); tabs[b.dataset.tab]();
+});
+loadStats(); renderReview();
+</script>
+</body>
+</html>

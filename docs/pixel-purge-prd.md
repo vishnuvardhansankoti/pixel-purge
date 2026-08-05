@@ -908,9 +908,15 @@ graph LR
     UI["SvelteKit build (served by the local server)"] --> BROWSER
 ```
 
-The SvelteKit front-end is built once (`npm run build`) and served as static assets by the same local
-FastAPI process that exposes the data + thumbnail endpoints. `pixel-purge dashboard` starts it and
-opens the browser.
+The front-end is served as static assets by the same local FastAPI process that exposes the data +
+thumbnail endpoints. `pixel-purge dashboard` starts it and opens the browser.
+
+> [!NOTE]
+> **Implementation deviation:** Phase 5 ships a **zero-build vanilla HTML/JS single-page UI**
+> (`dashboard/static/index.html`) rather than a SvelteKit build, to avoid a Node toolchain dependency
+> for a personal local tool. The contract is identical — a static app served by the local FastAPI
+> process, talking to the JSON API and `/thumb/{id}`. A SvelteKit front-end can replace `index.html`
+> later without touching the backend.
 
 **Thumbnail endpoint** — streams a downscaled JPEG from disk; the piece that makes every view render:
 
