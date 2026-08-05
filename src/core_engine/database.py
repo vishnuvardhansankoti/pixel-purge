@@ -282,6 +282,29 @@ class Database:
             (status, item_id),
         )
 
+    # ---- Module E: delta -------------------------------------------------
+    _DELTA_WATERMARK_KEY = "delta_watermark"
+
+    def get_delta_watermark(self) -> int:
+        v = self.get_state(self._DELTA_WATERMARK_KEY)
+        return int(v) if v is not None else 0
+
+    def set_delta_watermark(self, ts: int) -> None:
+        self.set_state(self._DELTA_WATERMARK_KEY, str(int(ts)))
+
+    def get_items_for_delta(self) -> list[MediaRecord]:
+        """Newly-added, non-duplicate, still-unclassified items to classify.
+
+        Idempotency comes from `classification_bucket IS NULL` — already-classified
+        items are never re-touched, so re-running a delta classifies nothing new [H5].
+        """
+        return self._query_records(
+            "SELECT * FROM media_items "
+            "WHERE is_duplicate = 0 AND ingestion_status = 'COMPLETE' "
+            "AND classification_bucket IS NULL "
+            "ORDER BY COALESCE(taken_timestamp, 0), id"
+        )
+
     # ---- Module D: cleanup ----------------------------------------------
     def get_deletions(self) -> list[MediaRecord]:
         """Items the human review marked for deletion."""

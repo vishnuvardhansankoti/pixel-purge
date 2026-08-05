@@ -8,6 +8,7 @@ No cloud hosting — everything runs on your machine. See [`docs/pixel-purge-prd
 - **Phase 1** (done): local Takeout ingestion + hierarchical deduplication CLI.
 - **Phase 2** (done): local AI vision (CLIP zero-shot) + face clustering (InsightFace/DBSCAN) + TUI review.
 - **Phase 3** (done): cleanup execution — deletion-manifest export (primary), curation + staging with format-aware metadata restore, gated clean-slate re-upload, experimental browser deletion.
+- **Phase 4** (done): local monthly delta classifier (`delta`) — reuses ingest+dedup, CLIP classification with GPS→TRIP override, watermark idempotency, launchd scheduling.
 
 ## Install
 
@@ -44,6 +45,11 @@ pixel-purge review                        # approve/reject flagged items (TUI)
 pixel-purge cleanup                        # export a deletion manifest (safe default)
 pixel-purge cleanup --strategy stage       # copy keepers to staging + restore metadata
 pixel-purge export -o manifest.csv         # full manifest CSV
+
+pixel-purge delta ~/Downloads/takeout-2026-08.tgz   # classify new photos (monthly)
+pixel-purge delta ... --dry-run            # report new items only
+pixel-purge delta --stats                  # per-bucket counts + watermark
+pixel-purge schedule ~/Downloads/Takeout   # install monthly launchd agent (macOS)
 ```
 
 Cleanup never deletes via the API (Google removed those scopes and never

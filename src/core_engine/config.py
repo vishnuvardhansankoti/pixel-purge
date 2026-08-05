@@ -21,12 +21,21 @@ class DedupConfig:
 
 
 @dataclass
+class DeltaConfig:
+    trip_distance_miles: float = 50.0
+    model: str = "ViT-B-32"
+    device: str = "auto"
+    notify: bool = True
+
+
+@dataclass
 class Config:
     db_path: Path = DEFAULT_DB_PATH
     log_level: str = "INFO"
     home_latitude: float = 0.0
     home_longitude: float = 0.0
     dedup: DedupConfig = field(default_factory=DedupConfig)
+    delta: DeltaConfig = field(default_factory=DeltaConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -52,5 +61,13 @@ class Config:
             gps_radius_meters=float(d.get("gps_radius_meters", DedupConfig.gps_radius_meters)),
             time_window_minutes=int(d.get("time_window_minutes", DedupConfig.time_window_minutes)),
             hamming_threshold=int(d.get("hamming_threshold", DedupConfig.hamming_threshold)),
+        )
+
+        dl = data.get("delta", {})
+        cfg.delta = DeltaConfig(
+            trip_distance_miles=float(dl.get("trip_distance_miles", DeltaConfig.trip_distance_miles)),
+            model=dl.get("model", DeltaConfig.model),
+            device=dl.get("device", DeltaConfig.device),
+            notify=bool(dl.get("notify", DeltaConfig.notify)),
         )
         return cfg

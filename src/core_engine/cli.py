@@ -134,6 +134,67 @@ def classify(
 
 
 @app.command()
+def delta(
+    source: Path = typer.Argument(..., help="Incremental Takeout .tgz or export directory"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report new items only"),
+    no_dedup: bool = typer.Option(False, "--no-dedup", help="Skip dedup vs manifest"),
+    stats: bool = typer.Option(False, "--stats", help="Show delta stats and exit"),
+    notify: bool = typer.Option(False, "--notify", help="Post a local notification when done"),
+) -> None:
+    """Module E: local monthly delta — ingest new export, dedup, CLIP-classify new items."""
+    from .delta import delta_run
+
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+        if stats:
+            _print_delta_stats(db)
+            return
+        result = delta_run(source, db, cfg, dry_run=dry_run, dedup=not no_dedup)
+        if not dry_run:
+            _print_delta_stats(db)
+            if notify:
+                _notify(f"Pixel Purge: classified {result.classified} new photo(s)")
+
+
+@app.command()
+def schedule(
+    source: Path = typer.Argument(..., help="Export path the monthly delta should process"),
+    day: int = typer.Option(1, help="Day of month to run"),
+    hour: int = typer.Option(9, help="Hour of day (0-23) to run"),
+) -> None:
+    """Install a launchd agent that runs `pixel-purge delta` monthly (macOS)."""
+    from .delta.scheduling import install_agent, load_hint
+
+    plist = install_agent(source, day=day, hour=hour)
+    console.print(load_hint(plist))
+
+
+def _notify(message: str) -> None:
+    """Best-effort macOS notification; silently no-op elsewhere."""
+    import shutil
+    import subprocess
+
+    if shutil.which("osascript"):
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'display notification "{message}" with title "Pixel Purge"'],
+                capture_output=True, timeout=10,
+            )
+        except subprocess.SubprocessError:
+            pass
+
+
+def _print_delta_stats(db: Database) -> None:
+    v = db.vision_stats()
+    table = Table(title="Delta Statistics", show_header=False)
+    for bucket in ("ADHOC_PURGE", "TRIP", "FAMILY_KEEP", "OTHER"):
+        table.add_row(bucket, str(v.get(bucket, 0)))
+    table.add_row("Watermark (epoch)", str(db.get_delta_watermark()))
+    console.print(table)
+
+
+@app.command()
 def review(
     batch_size: int = typer.Option(20, help="Items shown per review batch"),
 ) -> None:
