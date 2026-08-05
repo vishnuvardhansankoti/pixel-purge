@@ -124,11 +124,17 @@ Google Takeout uses inconsistent sidecar naming conventions. The merger must att
 
 ```
 Priority 1: {filename}.json                    (e.g., IMG_1234.jpg.json)
-Priority 2: {filename}.supplemental-metadata.json
-Priority 3: {stem}-edited.json                 (for edited copies)
-Priority 4: {stem}({n}).json                   (for duplicate-named exports)
-Priority 5: Match by photoTakenTime within same directory (±2s tolerance)
+Priority 2: {filename}.supplemental-metadata.json  (also matched on {stem}, plus
+            truncated variants: .supplemental-meta.json, .suppl.json)
+Priority 3: {stem}-edited.json                 (an "-edited" media file also maps
+            back to its base {base}.json)
+Priority 4: IMG_1234(1).jpg -> IMG_1234.jpg(1).json / IMG_1234(1).jpg.json / base
 ```
+
+Implemented in `ingestion/sidecar_merger.py::resolve_sidecar`. When no sidecar is
+found the item falls back to embedded EXIF (below); a ±2s `photoTakenTime`
+directory match is **not** implemented — the EXIF fallback covers that case in
+practice.
 
 #### Fields Extracted from Sidecar JSON
 
@@ -146,14 +152,27 @@ Priority 5: Match by photoTakenTime within same directory (±2s tolerance)
 
 #### Video Keyframe Extraction
 
-For video files (`.mp4`, `.mov`, `.avi`, `.mkv`, `.3gp`, `.webm`):
+For video files (`.mp4`, `.mov`, `.avi`, `.mkv`, `.3gp`, `.webm`, `.m4v`), several
+evenly-spaced keyframes are extracted for robust multi-frame dedup [M9]:
 
 ```python
-# Extract single keyframe at t=1s (or t=0s if video < 1s)
-ffmpeg -i {video_path} -ss 1 -frames:v 1 -q:v 2 {output_dir}/{stem}_keyframe.jpg
+# ingestion/keyframe.py::extract_keyframes — N frames at (i+1)/(N+1) of duration
+# (e.g. 25% / 50% / 75% for N=3); duration comes from ffprobe.
+for seek in [duration * (i + 1) / (n + 1) for i in range(n)]:
+    ffmpeg -y -ss {seek} -i {video} -frames:v 1 -q:v 2 {stem}_kf{idx}.jpg
 ```
 
-The extracted keyframe is stored alongside the video and used for all subsequent visual analysis (pHash, CLIP, face detection).
+- The **middle frame** is recorded as `keyframe_path` and used for thumbnails,
+  CLIP vision, and face detection.
+- **All frames** are recorded as `keyframe_paths` (JSON) and the probed
+  `duration_seconds` is stored; Tier 3 uses these for multi-frame video dedup.
+- If `ffmpeg`/`ffprobe` is not installed, keyframe extraction is skipped
+  gracefully — the video still participates in exact-hash dedup.
+
+Still images in HEIC/RAW are decoded through `ingestion/decode.py` (`pillow-heif`
+/ `rawpy` when the `[heic]`/`[raw]` extras are installed), which raises a clear
+`UnsupportedImageError` (log-and-skip) rather than crashing when a decoder is
+absent [M3].
 
 #### CLI Interface
 
@@ -173,64 +192,55 @@ pixel-purge ingest ~/Downloads/Takeout/ --dry-run
 
 #### Checkpoint & Resumability
 
-- Each successfully processed file is recorded in the `media_items` SQLite table with `ingestion_status = 'COMPLETE'`
-- On resume, the module queries for files in the source directory not yet present in the DB
-- Progress displayed via `rich.progress.Progress` bar showing files processed / total discovered
+- Each successfully processed file is recorded in `media_items` with `ingestion_status = 'COMPLETE'`; failures are recorded with `ingestion_status = 'ERROR'` and an `error_message` so they aren't retried forever.
+- On resume, the module skips files whose **full path** is already present (`db.get_ingested_paths()`) — keyed on `local_path` (the UNIQUE column), **not** the basename, because Takeout reuses filenames across albums [M1].
+- Progress displayed via `rich.progress.Progress` showing files processed / total discovered.
 
 #### Pseudo-code
 
 ```python
-def ingest(source_path: Path, db: Database, resume: bool = True):
-    """Module A: Ingest and merge metadata from Google Takeout export."""
+def ingest(source_path, db, resume=True, dry_run=False, extract_keyframes_enabled=True):
+    """Module A: ingest + merge metadata from a Google Takeout export."""
 
-    # 1. Determine input type
-    if source_path.suffix == '.tgz' or any(source_path.glob('*.tgz')):
-        archives = sorted(source_path.parent.glob('takeout-*.tgz'))
-        extract_dir = source_path.parent / '.pixel-purge-extracted'
-        for archive in archives:
-            extract_tgz(archive, extract_dir)
-        media_root = extract_dir
-    else:
-        media_root = source_path
+    # 1. Resolve input (auto-detect .tgz vs directory; extract archives safely)
+    media_root = resolve_media_root(Path(source_path))
 
-    # 2. Discover all media files
-    MEDIA_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.heic', '.heif',
-                        '.webp', '.bmp', '.tiff', '.raw', '.cr2', '.nef',
-                        '.mp4', '.mov', '.avi', '.mkv', '.3gp', '.webm'}
-    all_files = [f for f in media_root.rglob('*')
-                 if f.suffix.lower() in MEDIA_EXTENSIONS]
+    # 2. Discover media (extensions in ingestion/media.py — incl. heic/heif,
+    #    raw/cr2/nef/arw/dng, webp/bmp/tiff, mp4/mov/mkv/3gp/webm/m4v, ...)
+    all_files = discover_media_files(media_root)
 
-    # 3. Filter already-processed files on resume
+    # 3. Resume by FULL PATH, not basename [M1]
     if resume:
-        processed = db.get_processed_filenames()
-        all_files = [f for f in all_files if f.name not in processed]
+        already = db.get_ingested_paths()          # set of local_path
+        pending = [f for f in all_files if str(f) not in already]
+    else:
+        pending = all_files
 
-    # 4. Process each file
-    with Progress() as progress:
-        task = progress.add_task("Ingesting media...", total=len(all_files))
-        for media_file in all_files:
+    for media_file in pending:                     # (rich progress bar around this)
+        try:
             record = MediaRecord(filename=media_file.name,
                                  local_path=str(media_file),
                                  file_size=media_file.stat().st_size,
-                                 media_type=classify_media_type(media_file))
+                                 media_type=classify_media_type(media_file),
+                                 ingestion_status='COMPLETE')
 
-            # 4a. Resolve and merge sidecar JSON
+            # 3a. Sidecar JSON (5-priority resolution), else embedded EXIF fallback
             sidecar = resolve_sidecar(media_file)
             if sidecar:
                 merge_sidecar_metadata(record, sidecar)
+            if record.taken_timestamp is None or record.latitude is None:
+                extract_exif_metadata(record, media_file)   # fills time AND/OR GPS
 
-            # 4b. Fall back to embedded EXIF if sidecar missing
-            if not record.taken_timestamp:
-                extract_exif_metadata(record, media_file)
+            # 3b. Multi-frame video keyframes + duration [M9]
+            if record.media_type == 'VIDEO' and extract_keyframes_enabled:
+                kf = extract_keyframes(media_file)           # KeyframeSet
+                record.keyframe_path = str(kf.primary) if kf.primary else None
+                record.keyframe_paths = json.dumps([str(p) for p in kf.paths]) or None
+                record.duration_seconds = kf.duration
 
-            # 4c. Extract video keyframe
-            if record.media_type == 'VIDEO':
-                keyframe_path = extract_keyframe(media_file)
-                record.keyframe_path = str(keyframe_path)
-
-            # 4d. Insert into database
             db.insert_media_record(record)
-            progress.advance(task)
+        except Exception as e:                       # log-and-continue (PRD §4.4)
+            record_error(db, media_file, str(e))     # inserts an ERROR row
 ```
 
 ---
