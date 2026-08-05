@@ -8,10 +8,12 @@ from pathlib import Path
 from rich.console import Console
 from rich.progress import Progress
 
+import json
+
 from ..database import Database
 from ..models import MediaRecord
 from .exif_extractor import extract_exif_metadata
-from .keyframe import extract_keyframe
+from .keyframe import extract_keyframes
 from .media import classify_media_type
 from .sidecar_merger import merge_sidecar_metadata, resolve_sidecar
 from .takeout_parser import discover_media_files, resolve_media_root
@@ -34,7 +36,7 @@ def ingest(
     db: Database,
     resume: bool = True,
     dry_run: bool = False,
-    extract_keyframes: bool = True,
+    extract_keyframes_enabled: bool = True,
 ) -> IngestResult:
     """Ingest a Google Takeout export (archive or directory) into the manifest."""
     media_root = resolve_media_root(Path(source_path))
@@ -87,10 +89,14 @@ def ingest(
                     if extract_exif_metadata(record, media_file):
                         result.from_exif += 1
 
-                if record.media_type == "VIDEO" and extract_keyframes:
-                    kf = extract_keyframe(media_file)
-                    if kf is not None:
-                        record.keyframe_path = str(kf)
+                if record.media_type == "VIDEO" and extract_keyframes_enabled:
+                    kf = extract_keyframes(media_file)
+                    if kf.primary is not None:
+                        record.keyframe_path = str(kf.primary)
+                    if kf.paths:
+                        record.keyframe_paths = json.dumps([str(p) for p in kf.paths])
+                    if kf.duration is not None:
+                        record.duration_seconds = kf.duration
 
                 db.insert_media_record(record)
                 result.ingested += 1

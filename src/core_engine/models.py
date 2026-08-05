@@ -58,6 +58,7 @@ class MediaRecord:
 
     # Video
     keyframe_path: str | None = None
+    keyframe_paths: str | None = None  # JSON array of multi-frame keyframes [M9]
     duration_seconds: float | None = None
 
     # Module D: cleanup / upload
@@ -73,8 +74,22 @@ class MediaRecord:
 
     @property
     def visual_path(self) -> str:
-        """Path used for visual analysis (video keyframe if present)."""
+        """Path used for single-image analysis (video keyframe if present)."""
         return self.keyframe_path or self.local_path
+
+    @property
+    def frame_paths(self) -> list[str]:
+        """All frames to hash for dedup — multiple keyframes for videos [M9]."""
+        if self.keyframe_paths:
+            import json
+
+            try:
+                paths = json.loads(self.keyframe_paths)
+                if paths:
+                    return paths
+            except (ValueError, TypeError):
+                pass
+        return [self.visual_path]
 
     @property
     def metadata_richness(self) -> int:

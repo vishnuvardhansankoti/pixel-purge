@@ -55,7 +55,7 @@ def ingest(
     with Database(cfg.db_path) as db:
         db.init_schema()
         result = run_ingest(
-            source, db, resume=resume, dry_run=dry_run, extract_keyframes=keyframes
+            source, db, resume=resume, dry_run=dry_run, extract_keyframes_enabled=keyframes
         )
 
     table = Table(title="Ingestion Summary", show_header=False)

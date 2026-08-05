@@ -9,6 +9,10 @@ all that distinguishes two different text-dense images, so distinct receipts or
 chat screenshots often sit within the normal Hamming threshold. We compute text
 density inline (from the same image open) and require a **near-exact** threshold
 before merging when either candidate is text-heavy.
+
+Videos are compared by multi-frame pHash sets with a duration gate [M9] (see
+``video.py``), so re-encodes/trims still match while clips of very different
+length do not.
 """
 
 from __future__ import annotations
@@ -25,14 +29,17 @@ from ..ingestion.decode import UnsupportedImageError, open_image
 from ..vision import quality
 from .keeper import select_keeper
 from .spatial_bucket import Bucket
+from .video import duration_gate, frame_set_distance
 
 console = Console()
 
 
 @dataclass
 class _Analyzed:
-    phash: imagehash.ImageHash
+    frames: list[imagehash.ImageHash]  # 1 for photos, N for videos [M9]
     text_heavy: bool
+    is_video: bool
+    duration: float | None
 
 
 def compute_phash(path: str) -> imagehash.ImageHash:
@@ -40,15 +47,30 @@ def compute_phash(path: str) -> imagehash.ImageHash:
 
 
 def _analyze_bucket(db: Database, bucket: Bucket) -> dict[int, _Analyzed]:
-    """Compute + persist pHash and a text-heavy flag for each item (one image open)."""
+    """Compute + persist frame pHashes and a text-heavy flag for each item.
+
+    Photos hash their single image; videos hash every extracted keyframe [M9].
+    """
     out: dict[int, _Analyzed] = {}
     for item in bucket:
         try:
-            image = open_image(item.visual_path)
-            h = imagehash.phash(image)
+            primary = open_image(item.visual_path)
+            text_heavy = quality.is_text_heavy(quality.text_density(primary))
+
+            frames: list[imagehash.ImageHash] = []
+            for fp in item.frame_paths:
+                try:
+                    frames.append(imagehash.phash(open_image(fp)))
+                except (UnsupportedImageError, OSError, ValueError):
+                    continue
+            if not frames:
+                frames = [imagehash.phash(primary)]
+
             if not item.phash:
-                db.update_phash(item.id, str(h))
-            out[item.id] = _Analyzed(h, quality.is_text_heavy(quality.text_density(image)))
+                db.update_phash(item.id, str(frames[0]))
+            out[item.id] = _Analyzed(
+                frames, text_heavy, item.media_type == "VIDEO", item.duration_seconds
+            )
         except (UnsupportedImageError, OSError, ValueError) as e:
             console.print(f"[yellow]phash skip[/yellow] {item.filename}: {e}")
     return out
@@ -78,8 +100,14 @@ def run_tier3(
                 continue
 
             analyzed = _analyze_bucket(db, bucket)
-            hashes = {i: a.phash for i, a in analyzed.items()}
             usable = [it for it in bucket if it.id in analyzed]
+
+            def pair_distance(x: int, y: int) -> int:
+                ax, ay = analyzed[x], analyzed[y]
+                # Two videos of very different length are not the same clip [M9].
+                if ax.is_video and ay.is_video and not duration_gate(ax.duration, ay.duration):
+                    return 1 << 30
+                return frame_set_distance(ax.frames, ay.frames)
 
             # Union-find: connect any pair within its (guarded) threshold, so a
             # chain of near-identical frames becomes a single visual cluster.
@@ -93,7 +121,7 @@ def run_tier3(
 
             for i, a in enumerate(usable):
                 for b in usable[i + 1:]:
-                    dist = hashes[a.id] - hashes[b.id]  # Hamming distance
+                    dist = pair_distance(a.id, b.id)
                     text_heavy = analyzed[a.id].text_heavy or analyzed[b.id].text_heavy
                     threshold = text_hamming_threshold if text_heavy else hamming_threshold
                     if dist <= threshold:
@@ -111,7 +139,7 @@ def run_tier3(
                 cluster_id += 1
                 for m in members:
                     if m.id != keeper.id:
-                        d = hashes[m.id] - hashes[keeper.id]
+                        d = pair_distance(m.id, keeper.id)
                         db.flag_duplicate(
                             m.id, duplicate_of=keeper.id,
                             dedup_tier="VISUAL_PHASH", hamming_distance=int(d),

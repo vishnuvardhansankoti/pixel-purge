@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS media_items (
     cloud_media_id        TEXT,
 
     -- Video-specific
-    keyframe_path         TEXT,
+    keyframe_path         TEXT,           -- primary/middle keyframe (thumbnail + vision)
+    keyframe_paths        TEXT,           -- JSON array of multi-frame keyframes (dedup) [M9]
     duration_seconds      REAL,
 
     -- Processing status

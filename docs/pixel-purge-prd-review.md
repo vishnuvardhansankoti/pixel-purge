@@ -49,7 +49,7 @@ Status legend: ✅ resolved in v1.1 · ➖ moot in v1.1 (component removed) · �
 | **M6** | **Owner-email config drift** across Firestore rules / `ALLOWED_EMAIL` / `config.toml`. | ➖ **Moot.** No Firestore/hosted auth in v1.1; the local dashboard has no owner-email concept. |
 | **M7** | **`$0.00` required Blaze billing**; AI Studio free tier trains on inputs — contradicted §4.2. | ➖ **Moot.** §4.3 is now "no hosted infrastructure, no billing account required"; no cloud inference. |
 | **M8** | Storing `base_url` in Firestore is dead weight (expires ~60 min). | ➖ **Moot.** No Firestore; the local dashboard renders thumbnails from disk. |
-| **M9** | Single t=1s keyframe is fragile for video near-dup (misses re-encodes; false-matches similar openings). | ⚠️ **Open.** §2.3 unchanged. Multi-frame hash + duration/size gating. |
+| **M9** | Single t=1s keyframe is fragile for video near-dup (misses re-encodes; false-matches similar openings). | ✅ **Resolved.** Ingestion extracts N evenly-spaced keyframes (`extract_keyframes`); Tier 3 compares videos by **multi-frame pHash set (best-match)** with a **duration gate** (`dedup/video.py`), so re-encodes/trims match while different-length clips with a similar frame don't. Pure logic + Tier-3 integration tested (`tests/test_video_dedup.py`). |
 
 ---
 
@@ -70,18 +70,18 @@ The design decision — **fully local, no cloud hosting of any kind** — was ap
   Dockerfile/firebase/deploy files were replaced with their local equivalents. `OTHER` added to the
   `classification_bucket` CHECK constraint and CSV schema.
 
-This resolves **C1, C3, C4, H5** and moots **M6, M7, M8**; **H2** and **M3** are partially resolved.
+This resolves **C1, C3, C4, H5** and moots **M6, M7, M8**.
 
 ---
 
-## 3. Remaining open items (post Phases 1–3)
+## 3. Remaining open items (post Phases 1–5 + follow-ups)
 
-Phases 1–3 resolved the bulk of the findings (see the Status column). What's left:
+Every critical/high finding is now ✅ resolved. What's left is minor:
 
 1. **Keeper heuristic edge cases [M4]** — resolved for the common path; revisit if real libraries
    surface ties the current ordering doesn't break well.
-2. **Real-photo eval corpus [H2]** — the harness exists and is tested; substantiating the headline
-   ≥90%/≥85% numbers just needs a user-curated labeled set fed to `pixel-purge eval`.
+2. **Real-photo eval corpus [H2]** — the harness (`vision/eval.py` + `pixel-purge eval`) exists and
+   is tested; substantiating the headline ≥90%/≥85% numbers just needs a user-curated labeled set.
 
 Everything else from the original review is ✅/➖ in the tables above.
 

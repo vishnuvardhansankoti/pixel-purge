@@ -23,6 +23,7 @@ _INSERT_COLUMNS = (
     "original_title",
     "view_count",
     "keyframe_path",
+    "keyframe_paths",
     "duration_seconds",
     "error_message",
     "ingestion_status",
@@ -48,7 +49,14 @@ class Database:
     def init_schema(self) -> None:
         schema = resources.files("core_engine").joinpath("schema.sql").read_text()
         self.conn.executescript(schema)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive migrations for DBs created by an earlier schema."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(media_items)")}
+        if "keyframe_paths" not in cols:  # [M9]
+            self.conn.execute("ALTER TABLE media_items ADD COLUMN keyframe_paths TEXT")
 
     def close(self) -> None:
         self.conn.close()
