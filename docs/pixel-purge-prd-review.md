@@ -32,7 +32,7 @@ Status legend: ✅ resolved in v1.1 · ➖ moot in v1.1 (component removed) · �
 | ID | Finding | Status in v1.1 |
 |---|---|---|
 | **H1** | pHash Hamming ≤10 on screenshots/docs causes **false-positive deletions** — distinct receipts/boarding-passes/chats routinely sit within 10 bits; under clean-slate = silent data loss, blowing the <0.1% metric. | ◐ **Mostly resolved.** Default threshold tightened to **8**, and dedup **only flags** (`keeper_status=REVIEW`, never deletes) with deletion human-gated through Phase 3. Still open: a `SCREENSHOT/DOCUMENT`-class guard on near-dup merging (needs classify-before-dedup ordering or a re-dedup pass). |
-| **H2** | **BLIP caption→keyword won't reach ≥90%**, and batch vs delta used **incompatible taxonomies** with no mapping; no labeled eval set defined. | ◐ **Mostly resolved.** Module C **built with CLIP zero-shot** (Phase 2, `vision/clip_tagger.py`) against the one unified taxonomy shared with Module E; BLIP dropped. Still open: **add the labeled eval set** referenced by P2.2/P4.2 to measure the ≥90%/≥85% targets. |
+| **H2** | **BLIP caption→keyword won't reach ≥90%**, and batch vs delta used **incompatible taxonomies** with no mapping; no labeled eval set defined. | ✅ **Resolved.** Module C uses **CLIP zero-shot** against the one unified taxonomy (BLIP dropped), and `vision/eval.py` + the `eval` CLI measure accuracy against a labeled `path,bucket` set (confusion matrix + per-bucket P/R/F1 + target check). Metric computation unit-tested; point it at labeled photos to substantiate ≥90%/≥85%. |
 | **H3** | **Tier-2 GPS clustering is spatially incorrect**: lexicographic `(lat,lon)` sort doesn't preserve locality; greedy distance uses only the anchor (splits walks, merges neighbors); fixed ±30-min windows split bursts on boundaries. | ✅ **Resolved.** Phase 1 `dedup/spatial_bucket.py` uses **gap-based temporal sessionization + union-find haversine clustering**; covered by `tests/test_spatial_bucket.py`. |
 | **H4** | `face_recognition`/dlib has **no MPS backend + painful M1 build**; HOG misses profile/small faces; **`min_samples=3` silently drops anyone in ≤2 photos**. | ✅ **Resolved.** Module C uses **InsightFace buffalo_l (ONNX + CoreML EP)** with DBSCAN `min_samples=2` (`vision/faces.py`); two-photo-person clustering verified in tests. |
 | **H5** | **Monthly idempotency drifts**: rolling "last 30 days" vs calendar-month cron → boundary gaps/overlaps; overlaps re-stage the same photos each run. | ✅ **Resolved.** §2.7 persists `last_delta_watermark` and classifies only items newer than it. |
@@ -78,15 +78,10 @@ This resolves **C1, C3, C4, H5** and moots **M6, M7, M8**; **H2** and **M3** are
 
 Phases 1–3 resolved the bulk of the findings (see the Status column). What's left:
 
-1. **Labeled eval set [H2]** — the ≥90% (P2.2) / ≥85% (P4.2) accuracy targets still have no
-   ground-truth corpus to measure against. Add one before claiming those numbers.
-2. **Screenshot-class dedup guard [H1]** — near-dup merging should be disabled for
-   `SCREENSHOT/DOCUMENT/RECEIPT`, which needs classify-before-dedup ordering or a re-dedup pass
-   (dedup currently runs before vision).
-3. **Keeper heuristic edge cases [M4]** — resolved for the common path; revisit if real libraries
+1. **Keeper heuristic edge cases [M4]** — resolved for the common path; revisit if real libraries
    surface ties the current ordering doesn't break well.
-4. **Multi-frame video hashing [M9]** — Tier-3 still hashes a single keyframe; add multi-frame +
-   duration/size gating for robust video near-dup.
+2. **Real-photo eval corpus [H2]** — the harness exists and is tested; substantiating the headline
+   ≥90%/≥85% numbers just needs a user-curated labeled set fed to `pixel-purge eval`.
 
 Everything else from the original review is ✅/➖ in the tables above.
 

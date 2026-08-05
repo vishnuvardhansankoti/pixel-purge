@@ -53,7 +53,14 @@ pixel-purge delta --stats                  # per-bucket counts + watermark
 pixel-purge schedule ~/Downloads/Takeout   # install monthly launchd agent (macOS)
 
 pixel-purge dashboard                       # local UI at http://localhost:8787
+
+pixel-purge eval labeled.csv                # measure classifier accuracy (path,bucket CSV)
 ```
+
+To measure classification accuracy, curate a `labeled.csv` (columns `path,bucket`
+with buckets `ADHOC_PURGE`/`TRIP`/`FAMILY_KEEP`/`OTHER`) from your own photos and
+run `pixel-purge eval labeled.csv` — it prints a confusion matrix, per-bucket
+precision/recall/F1, and checks overall accuracy against `--target` (default 90%).
 
 The dashboard is a local FastAPI server (needs the `[dashboard]` extra:
 `pip install -e '.[dashboard]'`) serving a zero-build HTML/JS UI — no Node
