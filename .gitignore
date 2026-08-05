@@ -26,3 +26,7 @@ htmlcov/
 .vscode/
 
 SessionState.md
+
+# Local-only docs (kept on disk, not tracked)
+docs/initial-prompt.md
+docs/pixel-purge-prd-review.md

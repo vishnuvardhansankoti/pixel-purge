@@ -99,7 +99,7 @@ graph TB
 | Google Photos API | `google-api-python-client` + `google-auth-oauthlib` (upload / delete only) |
 | Delta Classifier | Local CLIP zero-shot (`open_clip` / `transformers`) — unified taxonomy, on-device |
 | Delta Scheduler | `launchd` (macOS) / `cron` — runs the local `pixel-purge delta` command |
-| Dashboard Framework | SvelteKit (dev/static build) served locally |
+| Dashboard UI | Zero-build vanilla HTML/JS, served by the local FastAPI process |
 | Dashboard Server | Local FastAPI + `uvicorn` (`localhost`), reads SQLite + streams thumbnails from disk |
 | Secret Management | macOS Keychain (`keyring`) — OAuth token stored locally |
 | Progress UI | `rich.progress` + `rich.table` |
@@ -782,7 +782,7 @@ graph LR
     BROWSER["Browser @ localhost:8787"] --> LSRV["Local server (FastAPI / uvicorn)"]
     LSRV -->|read/write| DB["SQLite manifest.db"]
     LSRV -->|/thumb/{id}| DISK["On-disk media (downscaled + cached)"]
-    UI["SvelteKit build (served by the local server)"] --> BROWSER
+    UI["Static UI: index.html (served by the local server)"] --> BROWSER
 ```
 
 The front-end is served as static assets by the same local FastAPI process that exposes the data +
@@ -1096,7 +1096,7 @@ account is required**.
 | Compute (ingest, dedup, vision, faces, delta classify) | Local — user's Mac | $0.00 |
 | Delta classifier (CLIP zero-shot) | Local model weights (~350 MB, one-time download) | $0.00 |
 | Data store (SQLite manifest) | Local file `~/.pixel-purge/manifest.db` | $0.00 |
-| Dashboard (FastAPI + SvelteKit build) | Local `localhost` server | $0.00 |
+| Dashboard (FastAPI + static vanilla UI) | Local `localhost` server | $0.00 |
 | Scheduler | macOS `launchd` / `cron` | $0.00 |
 | Secret storage | macOS Keychain | $0.00 |
 | Google Photos API | Upload / delete only; within standard user quota | $0.00 |
@@ -1126,6 +1126,12 @@ account is required**.
 ---
 
 ## 5. Implementation Roadmap & Functional Milestones
+
+> [!NOTE]
+> **Status: all five phases are implemented, tested, and on `main`** (81 passing tests). The milestone
+> tables below describe the delivered scope. Two follow-up review items remain minor/by-nature:
+> keeper-heuristic edge cases [M4], and curating a real-photo labeled set to substantiate the
+> ≥90%/≥85% accuracy targets via `pixel-purge eval` [H2]. Durations are the original estimates.
 
 ### 5.1 Phase Overview
 
@@ -1181,109 +1187,87 @@ gantt
 | **P1.6** Checkpoint Resume | Resumable processing for all Module A/B operations | Kill and restart mid-pipeline; verify no duplicate processing or data loss |
 | **P1.7** Test Suite | pytest fixtures with synthetic Takeout structure | All tests pass; CI-ready test harness |
 
-**Project Directory Structure:**
+**Project Directory Structure (as built):**
 
 ```
 pixel-purge/
 ├── pyproject.toml
 ├── README.md
-├── initial-prompt.md
+├── .gitignore
+├── docs/
+│   └── pixel-purge-prd.md          # (review + initial-prompt kept local, gitignored)
 ├── src/
-│   ├── core_engine/
-│   │   ├── __init__.py
-│   │   ├── cli.py                 # Typer CLI entry point
-│   │   ├── config.py              # Configuration management
-│   │   ├── database.py            # SQLite ORM / queries
-│   │   ├── models.py              # Data models (dataclasses)
-│   │   ├── ingestion/
-│   │   │   ├── __init__.py
-│   │   │   ├── takeout_parser.py  # Module A: Archive extraction
-│   │   │   ├── sidecar_merger.py  # Module A: JSON metadata merger
-│   │   │   └── exif_extractor.py  # Module A: EXIF fallback
-│   │   ├── dedup/
-│   │   │   ├── __init__.py
-│   │   │   ├── hash_dedup.py      # Module B: Tier 1 SHA-256
-│   │   │   ├── spatial_bucket.py  # Module B: Tier 2 spatiotemporal
-│   │   │   └── visual_dedup.py    # Module B: Tier 3 pHash
-│   │   ├── vision/
-│   │   │   ├── __init__.py
-│   │   │   ├── taxonomy.py        # Module C: unified taxonomy + CLIP prompts
-│   │   │   ├── clip_tagger.py     # Module C: CLIP zero-shot + rule fusion
-│   │   │   ├── quality.py         # Module C: numpy blur + text-density
-│   │   │   └── faces.py           # Module C: InsightFace + DBSCAN
-│   │   ├── cleanup/
-│   │   │   ├── __init__.py
-│   │   │   ├── clean_slate.py     # Module D: Strategy 1
-│   │   │   ├── browser_auto.py    # Module D: Strategy 2 (Playwright)
-│   │   │   ├── google_auth.py     # OAuth 2.0 helpers
-│   │   │   └── uploader.py        # Google Photos API upload
-│   │   ├── tui/
-│   │   │   ├── __init__.py
-│   │   │   └── review.py          # Rich TUI review interface
-│   │   ├── delta/
-│   │   │   ├── __init__.py
-│   │   │   ├── delta_run.py       # Module E: local delta pipeline entry point
-│   │   │   ├── clip_classify.py   # Module E: local CLIP zero-shot classifier
-│   │   │   └── scheduling.py      # Module E: launchd/cron plist generation
-│   │   └── dashboard/
-│   │       ├── __init__.py
-│   │       ├── server.py          # Module F: local FastAPI app (data + /thumb)
-│   │       └── thumbs.py          # Module F: on-disk thumbnail rendering + cache
-│   └── (no cloud package — everything runs locally)
-├── dashboard/                     # Module F: SvelteKit front-end (built, served locally)
-│   ├── package.json
-│   ├── svelte.config.js           # Static build (served by local FastAPI, not hosted)
-│   ├── vite.config.ts             # Vite config
-│   ├── src/
-│   │   ├── app.html
-│   │   ├── app.css                # Global styles (dark theme)
-│   │   ├── lib/
-│   │   │   ├── api.ts             # fetch() against local FastAPI endpoints
-│   │   │   └── stores.ts          # Svelte stores for app state
-│   │   └── routes/
-│   │       ├── +layout.svelte     # App shell + nav
-│   │       ├── +page.svelte       # Landing / dashboard overview
-│   │       ├── review/
-│   │       │   └── +page.svelte   # Delta Review view
-│   │       ├── dedup/
-│   │       │   └── +page.svelte   # Dedup Results Viewer
-│   │       └── faces/
-│   │           └── +page.svelte   # Face Cluster Gallery
-│   └── static/
-│       └── icons/
-├── tests/
-│   ├── __init__.py
-│   ├── conftest.py                # Shared fixtures
-│   ├── fixtures/
-│   │   ├── takeout_sample/        # Synthetic Takeout directory structure
-│   │   │   ├── Google Photos/
-│   │   │   │   ├── Album1/
-│   │   │   │   │   ├── IMG_001.jpg
-│   │   │   │   │   ├── IMG_001.jpg.json
-│   │   │   │   │   ├── IMG_002.jpg        # exact dupe of IMG_001
-│   │   │   │   │   ├── IMG_002.jpg.json
-│   │   │   │   │   └── IMG_003.jpg        # near-dupe (re-compressed)
-│   │   │   │   └── Screenshots/
-│   │   │   │       ├── Screenshot_01.png
-│   │   │   │       └── Screenshot_01.png.json
-│   │   │   └── metadata/
-│   │   └── sample_faces/          # Test images with known face counts
-│   ├── test_ingestion.py
-│   ├── test_sidecar_merger.py
-│   ├── test_hash_dedup.py
-│   ├── test_spatial_bucket.py
-│   ├── test_visual_dedup.py
-│   ├── test_quality.py
-│   ├── test_clip_fusion.py
-│   ├── test_faces_cluster.py
-│   ├── test_cleanup.py
-│   ├── test_review.py
-│   ├── test_delta_classify.py
-│   ├── test_dashboard_server.py
-│   └── test_database.py
-└── deploy/
-    └── com.pixelpurge.delta.plist  # launchd agent for the monthly local delta
+│   └── core_engine/
+│       ├── __init__.py
+│       ├── cli.py                   # Typer CLI (all commands)
+│       ├── config.py               # config.toml loader
+│       ├── database.py             # SQLite access + additive migrations
+│       ├── models.py               # MediaRecord dataclass
+│       ├── schema.sql              # manifest schema
+│       ├── ingestion/              # Module A
+│       │   ├── takeout_parser.py   #   .tgz extraction + discovery
+│       │   ├── sidecar_merger.py   #   Takeout JSON merge (5-priority)
+│       │   ├── exif_extractor.py   #   embedded-EXIF fallback
+│       │   ├── decode.py           #   HEIC/RAW decoding [M3]
+│       │   ├── keyframe.py         #   multi-frame video keyframes [M9]
+│       │   ├── media.py            #   extensions + media-type
+│       │   └── ingest.py           #   orchestrator (resume-by-path [M1])
+│       ├── dedup/                  # Module B
+│       │   ├── hash_dedup.py       #   Tier 1 SHA-256
+│       │   ├── spatial_bucket.py   #   Tier 2 sessionize + union-find [H3]
+│       │   ├── visual_dedup.py     #   Tier 3 pHash + text guard [H1]
+│       │   ├── video.py            #   multi-frame video distance [M9]
+│       │   ├── keeper.py           #   keeper selection [M4]
+│       │   ├── geo.py              #   haversine
+│       │   └── pipeline.py         #   3-tier orchestrator
+│       ├── vision/                 # Module C
+│       │   ├── taxonomy.py         #   unified taxonomy + CLIP prompts
+│       │   ├── clip_tagger.py      #   CLIP zero-shot + rule fusion
+│       │   ├── quality.py          #   numpy blur + text-density
+│       │   ├── faces.py            #   InsightFace + DBSCAN
+│       │   └── eval.py             #   accuracy harness [H2]
+│       ├── cleanup/                # Module D
+│       │   ├── export.py           #   deletion manifest / CSV (primary)
+│       │   ├── curate.py           #   stage keepers
+│       │   ├── metadata_restore.py #   format-aware EXIF restore [M2]
+│       │   ├── planner.py          #   plan + clean-slate gate [C2]
+│       │   ├── google_auth.py      #   OAuth (appendonly) + Keychain
+│       │   ├── uploader.py         #   batchCreate + resume
+│       │   └── browser_auto.py     #   experimental deletion by URL [M5]
+│       ├── tui/
+│       │   └── review.py           #   Rich TUI batch review
+│       ├── delta/                  # Module E
+│       │   ├── delta_run.py        #   local delta pipeline
+│       │   ├── gps_override.py     #   far-from-home -> TRIP
+│       │   └── scheduling.py       #   launchd plist generator
+│       └── dashboard/              # Module F
+│           ├── server.py           #   FastAPI (data API + /thumb)
+│           ├── thumbs.py           #   on-disk thumbnail cache
+│           └── static/
+│               └── index.html      #   zero-build vanilla UI (no Node)
+└── tests/                          # 81 tests; fixtures generated at runtime
+    ├── conftest.py
+    ├── test_database.py
+    ├── test_ingestion.py
+    ├── test_sidecar_merger.py
+    ├── test_hash_dedup.py
+    ├── test_spatial_bucket.py
+    ├── test_visual_dedup.py
+    ├── test_dedup_text_guard.py    # [H1]
+    ├── test_video_dedup.py         # [M9]
+    ├── test_quality.py
+    ├── test_clip_fusion.py
+    ├── test_faces_cluster.py
+    ├── test_eval.py                # [H2]
+    ├── test_review.py
+    ├── test_cleanup.py
+    ├── test_delta.py
+    └── test_dashboard.py
 ```
+
+> The monthly `launchd` plist is generated at runtime by `delta/scheduling.py` into
+> `~/Library/LaunchAgents/`; there is no committed `deploy/` directory. The dashboard UI is a
+> single static `index.html` served by FastAPI — no Node/SvelteKit build step.
 
 ### 5.3 Phase 2: Local Vision & Face Clustering Agent
 
@@ -1321,24 +1305,24 @@ pixel-purge/
 | Milestone | Description | Acceptance Criteria |
 |---|---|---|
 | **P4.1** Delta Pipeline | `pixel-purge delta` reuses Module A/B over an incremental Takeout/Picker export | New-input items ingested + deduped against the full existing manifest; no re-processing of old items |
-| **P4.2** CLIP Classifier | Local CLIP zero-shot classification into the unified taxonomy | 4-bucket classification on the labeled eval set with ≥85% accuracy; runs on MPS with CPU fallback |
+| **P4.2** CLIP Classifier | Local CLIP zero-shot into the unified taxonomy (shared with Module C); injectable for tests | Classifies new items on MPS with CPU fallback; ≥85% accuracy measurable via `pixel-purge eval` (labeled set) [H2] |
 | **P4.3** GPS Override Logic | Trip distance calculation + bucket override (local haversine) | Items > 50mi from home correctly reclassified as TRIP |
 | **P4.4** Watermark Idempotency | Persist/advance `last_delta_watermark`; only classify newer items | Re-running the same input classifies zero new items; no double-staging |
 | **P4.5** Scheduling | `launchd` plist (monthly) + optional local notification | Agent runs `pixel-purge delta` on schedule; candidates surfaced without manual trigger |
 
-### 5.6 Phase 5: Local Dashboard (SvelteKit + FastAPI)
+### 5.6 Phase 5: Local Dashboard (FastAPI + vanilla UI)
 
 **Duration:** ~16 days
 **Deliverables:**
 
 | Milestone | Description | Acceptance Criteria |
 |---|---|---|
-| **P5.1** Local Server + Scaffold | FastAPI app serving SQLite data + `/thumb/{id}` from disk; SvelteKit build; dark theme | `pixel-purge dashboard` opens `http://localhost:8787`; thumbnails render from local files |
+| **P5.1** Local Server + UI | FastAPI serving SQLite data + `/thumb/{id}` from disk; zero-build vanilla HTML/JS UI; dark theme | `pixel-purge dashboard` opens `http://localhost:8787`; thumbnails render from local files |
 | **P5.2** Delta Review view | Thumbnail grid, bucket filters, approve/reject, batch actions, confidence badges, reasoning tooltip | `keeper_status` changes persist to SQLite; approved purges feed Module D |
 | **P5.3** Thumbnail Rendering | On-disk downscale + cache; HEIC/RAW/video-keyframe support | No broken tiles across JPEG/PNG/HEIC/RAW/video; cached responses on repeat views |
 | **P5.4** Dedup Results Viewer | Side-by-side duplicate comparison, keeper override, metadata display | Reads dedup clusters straight from SQLite; keeper overrides persist |
 | **P5.5** Face Cluster Gallery | Person grid, name assignment, cluster merge/split | Names/merges persist to SQLite |
-| **P5.6** Packaging & QA | `pixel-purge dashboard` builds front-end if needed; graceful shutdown | Single-command launch on a clean machine; no external services required |
+| **P5.6** Packaging & QA | `pixel-purge dashboard` serves the static UI via uvicorn; single-command launch | Launches on a clean machine (`[dashboard]` extra); no Node/external services required |
 | **P5.7** Documentation | README, setup guide, configuration reference | Complete setup guide from zero to running system |
 
 ---
