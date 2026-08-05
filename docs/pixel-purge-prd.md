@@ -248,147 +248,115 @@ def ingest(source_path, db, resume=True, dry_run=False, extract_keyframes_enable
 ### 2.4 Module B: Hierarchical Deduplication Pipeline
 
 #### Purpose
-Identify and flag duplicate media items using a 3-tier hierarchical approach that reduces the O(N²) visual comparison problem to a tractable computation.
+Identify and **flag** duplicate media items using a 3-tier hierarchical approach that reduces the
+O(N²) visual comparison problem to a tractable computation. Duplicates are only marked
+(`is_duplicate=1`, `keeper_status='REVIEW'`) — never deleted here — so a false match cannot destroy
+an original [H1].
 
 #### Tier 1: Exact Binary Hash Dedup — O(N)
 
+SHA-256 every un-hashed item, group by digest, and flag every non-keeper in a group as an
+`EXACT_HASH` duplicate.
+
 ```python
-def tier1_exact_hash(db: Database):
-    """SHA-256 hash for exact bit-level duplicate detection."""
-    with Progress() as progress:
-        unprocessed = db.get_items_without_hash()
-        task = progress.add_task("Hashing files...", total=len(unprocessed))
+def run_tier1(db: Database) -> int:
+    for item in db.get_items_without_hash():
+        db.update_hash(item.id, sha256_file(item.local_path))
 
-        for item in unprocessed:
-            file_hash = sha256_file(item.local_path)
-            db.update_hash(item.id, file_hash)
-            progress.advance(task)
-
-    # Group by hash — any group with count > 1 contains exact duplicates
-    duplicate_groups = db.query("""
-        SELECT sha256_hash, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
-        FROM media_items
-        GROUP BY sha256_hash
-        HAVING cnt > 1
-    """)
-
-    for group in duplicate_groups:
-        keeper = select_keeper(group.ids)  # Keep oldest or highest-resolution
-        for dupe_id in group.ids:
-            if dupe_id != keeper:
-                db.flag_duplicate(dupe_id, duplicate_of=keeper,
-                                  dedup_tier='EXACT_HASH')
+    for id_group in db.get_exact_hash_groups():          # groups with COUNT(*) > 1
+        items = [db.get_item(i) for i in id_group]
+        keeper = select_keeper(items)                    # uses full item data [M4]
+        for item in items:
+            if item.id != keeper.id:
+                db.flag_duplicate(item.id, duplicate_of=keeper.id, dedup_tier='EXACT_HASH')
 ```
 
-**Keeper Selection Logic:** When exact duplicates are found, retain the copy with:
+**Keeper Selection (`dedup/keeper.py`)** — for byte-identical dupes, pixels are identical, so the
+tiebreak is provenance quality, most-preferred first [M4]:
+
 1. Richest metadata (most non-null sidecar fields)
-2. Earliest `taken_timestamp` (original)
-3. Longest filename (often contains original camera naming)
+2. Earliest `taken_timestamp` (the original capture)
+3. Largest file size (ties for exact dupes; meaningful for Tier 3)
+4. Longest filename (often retains the original camera name)
+5. Lowest `id` (stable deterministic tiebreak)
 
-#### Tier 2: Spatiotemporal Partitioning — O(N)
+#### Tier 2: Spatiotemporal Partitioning — O(N log N)
 
-Partition the remaining (non-exact-duplicate) items into buckets by GPS proximity and temporal proximity. This constrains the expensive Tier 3 visual comparison to small, local groups.
+Partition the remaining (non-exact-duplicate) items into small buckets so Tier 3 only compares
+plausibly-related shots. The v1.0 lexicographic-sort + single-anchor greedy walk was replaced to fix
+two correctness bugs [H3].
 
-**Bucketing Parameters (configurable via CLI):**
+**Bucketing Parameters:**
 
 | Parameter | Default | CLI Flag |
 |---|---|---|
 | GPS Radius | 100 meters | `--gps-radius` |
 | Time Window | ±30 minutes | `--time-window` |
 
-**GPS-less Fallback:** Items with no GPS coordinates are bucketed by **time-only** (±30 min windows). This correctly groups burst screenshots, sequential downloads, and rapid-fire photos taken indoors.
+The algorithm (`dedup/spatial_bucket.py`):
+
+1. **Gap-based temporal sessionization** — sort by `taken_timestamp` and start a new session only
+   when the gap to the previous item exceeds the window. This keeps a burst together even when it
+   straddles a clock boundary (the fixed-window bug in v1.0).
+2. **Union-find GPS sub-clustering within each session** — two items merge if they are within the
+   radius of *each other* (pairwise haversine), not just of a single anchor, so a walking sequence
+   isn't wrongly split and unrelated points aren't wrongly merged.
+3. **GPS-less items** in a session are bucketed by time only (correct for indoor bursts, sequential
+   downloads, screenshots). Items with **no timestamp** form one catch-all bucket.
 
 ```python
-def tier2_spatiotemporal_partition(db: Database,
-                                   gps_radius_m: float = 100.0,
-                                   time_window_min: int = 30) -> List[Bucket]:
-    """Group non-duplicate items into spatiotemporal buckets."""
-    items = db.get_non_duplicate_items()
+def partition(items, gps_radius_m=100.0, time_window_min=30) -> list[Bucket]:
     buckets = []
-
-    # Separate GPS-bearing and GPS-less items
-    gps_items = [i for i in items if i.latitude is not None]
-    no_gps_items = [i for i in items if i.latitude is None]
-
-    # GPS items: cluster by location first, then subdivide by time
-    gps_items.sort(key=lambda x: (x.latitude, x.longitude))
-    spatial_clusters = cluster_by_gps(gps_items, radius_m=gps_radius_m)
-
-    for spatial_group in spatial_clusters:
-        temporal_buckets = subdivide_by_time(spatial_group,
-                                             window_min=time_window_min)
-        buckets.extend(temporal_buckets)
-
-    # GPS-less items: cluster by time only
-    no_gps_items.sort(key=lambda x: x.taken_timestamp or 0)
-    time_buckets = subdivide_by_time(no_gps_items,
-                                      window_min=time_window_min)
-    buckets.extend(time_buckets)
-
+    for session in sessionize_by_time(with_timestamp(items), time_window_min):  # gap-based
+        gps_items   = [i for i in session if i.latitude is not None]
+        no_gps      = [i for i in session if i.latitude is None]
+        if gps_items:
+            buckets.extend(cluster_by_gps_unionfind(gps_items, gps_radius_m))
+        if no_gps:
+            buckets.append(no_gps)
+    if without_timestamp(items):
+        buckets.append(without_timestamp(items))
     return buckets
-
-
-def cluster_by_gps(items: List[MediaRecord],
-                   radius_m: float) -> List[List[MediaRecord]]:
-    """Greedy clustering: start a new cluster when distance exceeds radius."""
-    clusters = []
-    current_cluster = [items[0]]
-
-    for item in items[1:]:
-        dist = haversine(current_cluster[0].latitude,
-                         current_cluster[0].longitude,
-                         item.latitude, item.longitude)
-        if dist <= radius_m:
-            current_cluster.append(item)
-        else:
-            clusters.append(current_cluster)
-            current_cluster = [item]
-
-    clusters.append(current_cluster)
-    return clusters
 ```
 
 #### Tier 3: Visual Perceptual Hash Comparison — O(B × K²)
 
-Within each spatiotemporal bucket (typically 2–20 items), compute pHash and compare all pairs. This reduces the global O(N²) to O(B × K²) where B = number of buckets and K = average bucket size.
+Within each bucket, compute pHash and connect near-duplicate pairs with **union-find**, so a chain of
+near-identical frames collapses into one visual cluster. Each cluster's keeper is chosen by the same
+`select_keeper` logic; the rest are flagged `VISUAL_PHASH`.
 
-**Hamming Distance Threshold:** ≤ 10 bits (out of 64-bit pHash). This catches:
-- Re-compressed JPEGs (typically 0–4 bits different)
-- Slight crops or rotations (typically 4–8 bits different)
-- Screenshot variants with minor text changes (typically 6–10 bits different)
+**Hamming threshold:** default **8** (`--hamming-threshold`), tightened from the PRD's 10 to reduce
+false merges. Two guards make this safe [H1] [M9]:
+
+- **Screenshot/document guard [H1]:** pHash discards the high-frequency detail that distinguishes two
+  different text-dense images, so distinct receipts/screenshots often sit within the normal
+  threshold. Tier 3 computes text density inline (same image open) and requires the near-exact
+  `text_hamming_threshold` (default **2**, `--text-hamming-threshold`) when either candidate is
+  text-heavy.
+- **Multi-frame video matching [M9]:** videos are compared as a *set* of keyframe pHashes (best-match
+  distance) with a **duration gate** (`dedup/video.py`), so re-encodes/trims still match while clips
+  of very different length that happen to share a frame do not.
 
 ```python
-def tier3_visual_dedup(db: Database, buckets: List[Bucket],
-                       hamming_threshold: int = 10):
-    """pHash comparison within spatiotemporal buckets."""
-    with Progress() as progress:
-        task = progress.add_task("Visual dedup...", total=len(buckets))
-
-        for bucket in buckets:
-            if len(bucket.items) < 2:
-                progress.advance(task)
+def run_tier3(db, buckets, hamming_threshold=8, text_hamming_threshold=2):
+    for bucket in buckets:
+        analyzed = analyze_bucket(db, bucket)     # per item: frame pHashes, text_heavy, duration
+        parent = UnionFind(bucket)
+        for a, b in pairs(bucket):
+            dist = pair_distance(a, b)            # frame-set min-distance; ∞ if duration gate fails
+            threshold = text_hamming_threshold if (a.text_heavy or b.text_heavy) else hamming_threshold
+            if dist <= threshold:
+                parent.union(a, b)
+        for members in parent.groups():
+            if len(members) < 2:
                 continue
-
-            # Compute pHash for each item in bucket
-            for item in bucket.items:
-                img_path = item.keyframe_path or item.local_path
-                phash = compute_phash(img_path)  # imagehash.phash()
-                db.update_phash(item.id, str(phash))
-
-            # Pairwise comparison within bucket
-            for i, item_a in enumerate(bucket.items):
-                for item_b in bucket.items[i+1:]:
-                    distance = hamming_distance(item_a.phash, item_b.phash)
-                    if distance <= hamming_threshold:
-                        keeper = select_keeper([item_a.id, item_b.id])
-                        dupe = item_b.id if keeper == item_a.id else item_a.id
-                        db.flag_duplicate(dupe, duplicate_of=keeper,
-                                          dedup_tier='VISUAL_PHASH',
-                                          hamming_distance=distance)
-
-            # Assign phash_cluster_id to groups of visual duplicates
-            assign_phash_clusters(db, bucket)
-            progress.advance(task)
+            keeper = select_keeper(members)
+            db.set_phash_cluster([m.id for m in members], next_cluster_id())
+            for m in members:
+                if m.id != keeper.id:
+                    db.flag_duplicate(m.id, duplicate_of=keeper.id,
+                                      dedup_tier='VISUAL_PHASH',
+                                      hamming_distance=pair_distance(m, keeper))
 ```
 
 #### CLI Interface
@@ -398,17 +366,15 @@ def tier3_visual_dedup(db: Database, buckets: List[Bucket],
 pixel-purge dedup
 
 # Run with custom thresholds
-pixel-purge dedup --gps-radius 200 --time-window 60 --hamming-threshold 8
+pixel-purge dedup --gps-radius 200 --time-window 60 \
+                  --hamming-threshold 8 --text-hamming-threshold 2
 
-# Dry run — report duplicate candidates without flagging
-pixel-purge dedup --dry-run
+# Run a single tier only (Tier 3 rebuilds Tier 2 buckets on the fly)
+pixel-purge dedup --tier 1        # exact hash only
+pixel-purge dedup --tier 2        # spatiotemporal bucketing only
+pixel-purge dedup --tier 3        # visual comparison only
 
-# Run specific tier only
-pixel-purge dedup --tier 1  # exact hash only
-pixel-purge dedup --tier 2  # spatiotemporal bucketing only
-pixel-purge dedup --tier 3  # visual comparison only (requires tier 2)
-
-# Show dedup statistics
+# Show dedup statistics (counts + reclaimable bytes)
 pixel-purge dedup --stats
 ```
 
@@ -417,8 +383,8 @@ pixel-purge dedup --stats
 | Tier | Time Complexity | Estimated Time |
 |---|---|---|
 | Tier 1 (SHA-256) | O(N) | ~5 minutes |
-| Tier 2 (Bucketing) | O(N log N) | ~30 seconds |
-| Tier 3 (pHash) | O(B × K²), K ≈ 5 avg | ~15 minutes |
+| Tier 2 (sessionize + union-find) | O(N log N) | ~30 seconds |
+| Tier 3 (pHash, K ≈ 5 avg) | O(B × K²) | ~15 minutes |
 | **Total** | | **~20 minutes** |
 
 ---
@@ -542,232 +508,133 @@ pixel-purge classify --stats
 
 ---
 
-### 2.6 Module D: Cloud Cleanup Execution Engine
+### 2.6 Module D: Cleanup Execution Engine
 
 #### Purpose
-Execute the actual cleanup of the Google Photos cloud library based on the manifest decisions. Supports two strategies with full human review before any destructive action.
+Turn the manifest's review decisions into action against the Google Photos library. The **default,
+safe path is a reviewable deletion manifest** the user acts on; destructive re-upload ("clean-slate")
+is a gated last resort. Nothing is auto-deleted, and the Google Photos API is never used to delete.
 
-#### Authentication
+> [!IMPORTANT]
+> **API reality [C1]:** the Photos Library API cannot delete media items and (since 2025) can no
+> longer read the library. So "targeted deletion via API" is not possible — deletion is either manual
+> (using the exported manifest) or via the experimental browser driver. Only **upload**
+> (`mediaItems:batchCreate`, `photoslibrary.appendonly`) remains available, for the re-upload path.
+
+#### Authentication (`cleanup/google_auth.py`)
+
+Only the append-only (upload) scope is requested — the library-read/sharing scopes were removed by
+Google and are intentionally not used. Tokens are stored in the **macOS Keychain** (`keyring`) with a
+0600 local-JSON fallback.
 
 ```python
-SCOPES = [
-    'https://www.googleapis.com/auth/photoslibrary',
-    'https://www.googleapis.com/auth/photoslibrary.appendonly',
-    'https://www.googleapis.com/auth/photoslibrary.sharing',
-]
+SCOPES = ['https://www.googleapis.com/auth/photoslibrary.appendonly']
 
-def authenticate_local():
-    """OAuth 2.0 Desktop App flow for local CLI usage."""
-    creds = None
-    token_path = Path.home() / '.pixel-purge' / 'token.json'
-    client_secret_path = Path.home() / '.pixel-purge' / 'client_secret.json'
-
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(client_secret_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json())
-
-    return build('photoslibrary', 'v1', credentials=creds,
-                 static_discovery=False)
+def build_photos_service(client_secret_path=None):
+    """Desktop OAuth flow; refreshes or runs the installed-app flow as needed.
+    Token persisted via keyring (Keychain) -> encrypted-permission JSON fallback."""
+    creds = get_credentials(client_secret_path)          # load_token / refresh / flow
+    return build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
 ```
 
-#### Strategy 1: Clean Slate (Primary)
+#### Primary: Deletion Manifest Export (`cleanup/export.py`)
 
-**Workflow:**
-1. **Pre-flight Audit:** Display manifest summary — items to keep vs. discard
-2. **Human Review:** Rich TUI table showing flagged items, user confirms batch-by-batch
-3. **Local Curation:** Copy keeper files to a clean staging directory
-4. **Metadata Restoration:** Write restored EXIF data (GPS, timestamps) back into files via `piexif`
-5. **Manual Cloud Wipe:** User manually selects all photos in Google Photos web UI and deletes (API cannot do this)
-6. **Programmatic Re-upload:** Upload curated set via `mediaItems:batchCreate` with rate limiting
-7. **Album Reconstruction:** Recreate album structure from manifest metadata
+The recommended path. Writes a plain, inspectable CSV of everything marked `keeper_status='DELETE'`
+(the §3.3 schema). The user reviews it and deletes those items in Google Photos, or feeds it to the
+experimental browser driver.
 
-```python
-def execute_clean_slate(db: Database, service, staging_dir: Path):
-    """Strategy 1: Clean slate — curate locally, wipe cloud, re-upload."""
-
-    # Step 1: Build curated file list
-    keepers = db.get_keeper_items()  # Items NOT flagged as duplicates
-    console.print(f"[bold]Clean Slate Summary:[/bold]")
-    console.print(f"  Total items: {db.get_total_count()}")
-    console.print(f"  Keeping: {len(keepers)}")
-    console.print(f"  Discarding: {db.get_total_count() - len(keepers)}")
-
-    # Step 2: Interactive TUI review
-    if not confirm_with_tui(keepers, db):
-        console.print("[yellow]Aborted by user.[/yellow]")
-        return
-
-    # Step 3: Copy keepers to staging directory
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    with Progress() as progress:
-        task = progress.add_task("Staging files...", total=len(keepers))
-        for item in keepers:
-            dest = staging_dir / item.filename
-            shutil.copy2(item.local_path, dest)
-            restore_exif(dest, item)  # Write GPS + timestamp back to EXIF
-            progress.advance(task)
-
-    # Step 4: Prompt user for manual cloud wipe
-    console.print("\n[bold red]⚠️  ACTION REQUIRED:[/bold red]")
-    console.print("  1. Open photos.google.com in your browser")
-    console.print("  2. Select ALL photos (Ctrl+A / Cmd+A)")
-    console.print("  3. Delete them and empty trash")
-    console.print("  4. Wait 1 hour for deletion to propagate")
-
-    if not Confirm.ask("Have you completed the cloud wipe?"):
-        console.print("[yellow]Paused. Run `pixel-purge cleanup "
-                      "--resume-upload` when ready.[/yellow]")
-        return
-
-    # Step 5: Re-upload curated set
-    upload_to_google_photos(service, staging_dir, db)
-
-
-def upload_to_google_photos(service, staging_dir: Path, db: Database):
-    """Upload files via Google Photos API with rate limiting and resume."""
-    files = sorted(staging_dir.iterdir())
-    uploaded = db.get_uploaded_filenames()
-    remaining = [f for f in files if f.name not in uploaded]
-
-    BATCH_SIZE = 50
-    RATE_LIMIT_DELAY = 0.8  # ~75 requests/min
-
-    with Progress() as progress:
-        task = progress.add_task("Uploading...", total=len(remaining))
-
-        for batch in chunked(remaining, BATCH_SIZE):
-            upload_tokens = []
-            for file_path in batch:
-                # Step 5a: Upload bytes to get upload token
-                token = upload_media_bytes(service, file_path)
-                upload_tokens.append((file_path, token))
-                time.sleep(RATE_LIMIT_DELAY)
-
-            # Step 5b: Create media items from upload tokens
-            new_items = [
-                {'simpleMediaItem': {
-                    'uploadToken': token,
-                    'fileName': path.name
-                }}
-                for path, token in upload_tokens
-            ]
-
-            result = service.mediaItems().batchCreate(
-                body={'newMediaItems': new_items}
-            ).execute()
-
-            # Step 5c: Record upload status
-            for item_result in result.get('newMediaItemResults', []):
-                status = item_result.get('status', {})
-                if status.get('code') == 0:  # OK
-                    db.mark_uploaded(item_result['mediaItem']['filename'])
-
-            progress.advance(task, advance=len(batch))
+```bash
+pixel-purge cleanup                      # writes deletions.csv (safe default)
+pixel-purge cleanup -o my-deletions.csv
+pixel-purge export -o manifest.csv       # full manifest
+pixel-purge export -o dels.csv --deletions-only
 ```
 
-#### Strategy 2: Browser Automation (Secondary)
+#### Curation & Staging (`cleanup/curate.py`)
 
-**Workflow:**
-1. **Generate deletion manifest:** List of filenames to delete
-2. **Launch Playwright browser:** Navigate to `photos.google.com`
-3. **For each deletion candidate:** Search by filename → select → delete
-4. **Rate limiting:** 5-second delay between operations to avoid security flags
+Copies keepers (everything not marked `DELETE`) to a clean staging directory and restores metadata
+into each copy, so a re-uploaded library keeps correct dates/locations.
+
+**Format-aware metadata restore [M2]** (`cleanup/metadata_restore.py`) — v1.0 used `piexif`
+unconditionally, which is JPEG/TIFF-only and silently dropped metadata for PNG/HEIC/video:
+
+| Format | Restorer |
+|---|---|
+| JPEG / TIFF | `piexif` (always available) |
+| HEIC / PNG / video | `exiftool` subprocess (clear skip-with-reason when not installed) |
+
+```bash
+pixel-purge cleanup --strategy stage --staging-dir ~/pixel-purge-staging
+```
+
+#### Clean-Slate Re-upload (gated last resort) [C2]
+
+Wiping the cloud library and re-uploading a curated set is irreversible — album shares, Memories,
+shared links, and Google's own face grouping are lost, and there is no rollback. It is therefore
+**demoted from v1.0's "primary" to a gated path** requiring two independent confirmations
+(`cleanup/planner.py::clean_slate_allowed`):
 
 ```python
-async def execute_browser_automation(db: Database):
-    """Strategy 2: Playwright-based targeted deletion."""
+CONFIRM_PHRASE = "DELETE MY LIBRARY"
 
-    deletions = db.get_items_flagged_for_deletion()
+def clean_slate_allowed(typed_confirmation, have_backup) -> bool:
+    return bool(have_backup) and (typed_confirmation or "").strip() == CONFIRM_PHRASE
+```
 
-    console.print(f"[bold]Browser Automation:[/bold] {len(deletions)} items "
-                  f"to delete")
-    console.print("[yellow]⚠️  This will open a browser window. "
-                  "You may need to log in to Google Photos.[/yellow]")
+Workflow:
 
-    if not Confirm.ask("Proceed?"):
-        return
+```bash
+# 1. Stage keepers + restore metadata (also runs the pre-flight plan summary)
+pixel-purge cleanup --strategy stage --staging-dir ~/pixel-purge-staging
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            storage_state=get_browser_state_path()  # Reuse login session
-        )
-        page = await context.new_page()
+# 2. Gate + stage; then the user MANUALLY wipes the library and empties trash
+pixel-purge cleanup --strategy clean-slate \
+    --i-have-a-backup --confirm "DELETE MY LIBRARY"
 
-        with Progress() as progress:
-            task = progress.add_task("Deleting...", total=len(deletions))
+# 3. Re-upload the staged set (rate-limited, resumable)
+pixel-purge cleanup --strategy upload        # needs the [gphoto] extra
+```
 
-            for item in deletions:
-                try:
-                    # Navigate to search
-                    search_url = (f"https://photos.google.com/search/"
-                                  f"{quote(item.filename)}")
-                    await page.goto(search_url)
-                    await page.wait_for_timeout(3000)
+**Uploader (`cleanup/uploader.py`)** — two-step per file (raw-bytes upload → `mediaItems:batchCreate`)
+in batches of 50 with ~0.8s pacing and exponential backoff. **Resumable:** items already
+`upload_status='UPLOADED'` are skipped, so a crash costs at most one batch.
 
-                    # Find and select the photo
-                    photo_el = await page.query_selector(
-                        f'[aria-label*="{item.filename}"]')
-                    if photo_el:
-                        await photo_el.click()
-                        await page.wait_for_timeout(1000)
+#### Experimental: Browser Automation [M5] (`cleanup/browser_auto.py`)
 
-                        # Click delete button
-                        delete_btn = await page.query_selector(
-                            '[aria-label="Delete"]')
-                        if delete_btn:
-                            await delete_btn.click()
-                            await page.wait_for_timeout(1000)
+Opt-in targeted deletion via Playwright (`[browser]` extra). It navigates to each `DELETE` item by
+its **stored Google Photos URL** (`cloud_media_id`), **not** filename search (which Google Photos does
+not reliably index) — items without a known URL are skipped and reported.
 
-                            # Confirm deletion
-                            confirm_btn = await page.query_selector(
-                                'button:has-text("Move to trash")')
-                            if confirm_btn:
-                                await confirm_btn.click()
-                                db.mark_deleted(item.id)
-
-                    await page.wait_for_timeout(5000)  # Rate limit
-
-                except Exception as e:
-                    db.log_deletion_error(item.id, str(e))
-
-                progress.advance(task)
-
-        await browser.close()
+```bash
+pixel-purge cleanup --strategy browser-auto     # experimental; verify results afterward
 ```
 
 > [!WARNING]
-> Browser Automation is inherently fragile. Google frequently updates their web UI DOM structure. Selectors may break without notice. This strategy should be considered experimental and requires manual verification after each run.
+> Browser automation is inherently fragile — Google changes the Photos web DOM without notice. Treat
+> it as best-effort; the exported deletion manifest is the reliable path.
 
 #### CLI Interface
 
 ```bash
-# Interactive TUI review of all flagged items
-pixel-purge review
+# Safe default: export a reviewable deletion manifest
+pixel-purge cleanup
 
-# Execute Clean Slate strategy
-pixel-purge cleanup --strategy clean-slate --staging-dir ~/pixel-purge-staging/
+# Stage keepers with metadata restore
+pixel-purge cleanup --strategy stage --staging-dir ~/pixel-purge-staging
 
-# Execute Browser Automation strategy
+# Gated clean-slate + resumable re-upload
+pixel-purge cleanup --strategy clean-slate --i-have-a-backup --confirm "DELETE MY LIBRARY"
+pixel-purge cleanup --strategy upload
+
+# Experimental browser deletion
 pixel-purge cleanup --strategy browser-auto
 
-# Resume interrupted upload (Clean Slate)
-pixel-purge cleanup --resume-upload
+# Preview any strategy without changing anything
+pixel-purge cleanup --strategy stage --dry-run
 
-# Dry run — show what would be deleted/uploaded
-pixel-purge cleanup --strategy clean-slate --dry-run
-
-# Export deletion manifest as CSV
-pixel-purge export --format csv --output manifest.csv
+# CSV export
+pixel-purge export -o manifest.csv
+pixel-purge export -o deletions.csv --deletions-only
 ```
 
 ---
@@ -1281,8 +1148,8 @@ gantt
     Integration tests                 :p2d, after p2c, 2d
 
     section Phase 3
-    Module D: Clean Slate Engine      :p3a, after p2d, 5d
-    Module D: Browser Automation      :p3b, after p3a, 4d
+    Module D: Export + curation       :p3a, after p2d, 5d
+    Module D: OAuth + resumable upload :p3b, after p3a, 4d
     End-to-end testing                :p3c, after p3b, 3d
 
     section Phase 4
@@ -1432,19 +1299,19 @@ pixel-purge/
 | **P2.5** DBSCAN Clustering | Unsupervised face grouping, cosine, `min_samples=2` [H4] | Same person clustered (incl. 2-photo people); different people separated |
 | **P2.6** TUI Review | Rich interactive table for batch review of flagged items | User can approve/reject batches; changes persisted to DB |
 
-### 5.4 Phase 3: Web Automation / Cleanup Execution Module
+### 5.4 Phase 3: Cleanup Execution Module
 
 **Duration:** ~12 days
 **Deliverables:**
 
 | Milestone | Description | Acceptance Criteria |
 |---|---|---|
-| **P3.1** Google OAuth Setup | Desktop app OAuth 2.0 flow + token persistence | Successful auth with correct scopes; token refresh works |
-| **P3.2** Clean Slate Engine | Local curation + EXIF restoration + API re-upload | Files staged correctly; EXIF metadata preserved; upload with rate limiting |
-| **P3.3** Upload Resumability | Checkpoint-based upload with crash recovery | Kill mid-upload; resume picks up from last successful batch |
-| **P3.4** Browser Automation | Playwright-based search-and-delete workflow | Successfully deletes test items from a test Google Photos account |
-| **P3.5** Dry Run Mode | All cleanup commands support `--dry-run` | Dry run produces accurate report without modifying any data |
-| **P3.6** End-to-End Test | Full pipeline: ingest → dedup → classify → review → cleanup | Complete workflow on synthetic 100-item test library |
+| **P3.1** Deletion manifest export | CSV of `DELETE` items (safe primary path) + full-manifest export | Correct rows exported; the default `cleanup` writes a reviewable manifest |
+| **P3.2** Curation + metadata restore | Stage keepers; format-aware GPS/timestamp restore (piexif JPEG/TIFF, exiftool HEIC/PNG/video) [M2] | Files staged; metadata written to JPEG; clear skip-with-reason for missing exiftool |
+| **P3.3** Google OAuth + uploader | Desktop OAuth (appendonly scope) + Keychain token; `batchCreate` upload, rate-limited + resumable | Auth + refresh work; kill mid-upload and resume skips `UPLOADED` items |
+| **P3.4** Clean-slate gate [C2] | Clean-slate demoted behind `--i-have-a-backup` + typed `DELETE MY LIBRARY` | Refuses without both conditions (exit 1); proceeds only when both hold |
+| **P3.5** Browser automation (experimental) [M5] | Opt-in Playwright deletion by stored Google Photos URL, not filename search | Skips/reports items without a known URL; marked experimental |
+| **P3.6** Dry Run + E2E | `--dry-run` on cleanup strategies; full ingest → dedup → classify → review → cleanup | Dry run changes nothing; complete workflow on a synthetic test library |
 
 ### 5.5 Phase 4: Local Monthly Delta Classifier
 
