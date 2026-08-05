@@ -7,6 +7,7 @@ No cloud hosting — everything runs on your machine. See [`docs/pixel-purge-prd
 
 - **Phase 1** (done): local Takeout ingestion + hierarchical deduplication CLI.
 - **Phase 2** (done): local AI vision (CLIP zero-shot) + face clustering (InsightFace/DBSCAN) + TUI review.
+- **Phase 3** (done): cleanup execution — deletion-manifest export (primary), curation + staging with format-aware metadata restore, gated clean-slate re-upload, experimental browser deletion.
 
 ## Install
 
@@ -39,10 +40,21 @@ pixel-purge classify --faces-only         # just face clustering
 pixel-purge classify --stats              # classification statistics
 
 pixel-purge review                        # approve/reject flagged items (TUI)
+
+pixel-purge cleanup                        # export a deletion manifest (safe default)
+pixel-purge cleanup --strategy stage       # copy keepers to staging + restore metadata
+pixel-purge export -o manifest.csv         # full manifest CSV
 ```
 
+Cleanup never deletes via the API (Google removed those scopes and never
+supported media deletion). The default `cleanup` writes a reviewable deletion
+manifest; `clean-slate` is a gated last resort requiring `--i-have-a-backup` and
+`--confirm "DELETE MY LIBRARY"`. Upload/browser paths need the `[gphoto]`/`[browser]`
+extras.
+
 Duplicates and purge candidates are **flagged for review, never auto-deleted** —
-deletion is a separate, human-gated step (Module D, later phase).
+the human decision (approve/reject) is recorded first, and even then deletion is
+manual or via the experimental browser driver.
 
 ## Development
 

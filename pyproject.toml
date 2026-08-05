@@ -40,6 +40,14 @@ faces = [
     "onnxruntime>=1.17",
     "scikit-learn>=1.4",
 ]
+# Module D cleanup: Google Photos upload (re-upload path) + secure token storage.
+gphoto = [
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "keyring>=24",
+]
+# Module D optional: experimental targeted browser deletion.
+browser = ["playwright>=1.44"]
 
 dev = [
     "pytest>=8.2",

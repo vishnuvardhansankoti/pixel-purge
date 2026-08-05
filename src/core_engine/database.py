@@ -282,6 +282,50 @@ class Database:
             (status, item_id),
         )
 
+    # ---- Module D: cleanup ----------------------------------------------
+    def get_deletions(self) -> list[MediaRecord]:
+        """Items the human review marked for deletion."""
+        return self._query_records(
+            "SELECT * FROM media_items WHERE keeper_status = 'DELETE' ORDER BY id"
+        )
+
+    def get_keepers(self) -> list[MediaRecord]:
+        """Everything to retain: not marked DELETE (used to stage the curated set)."""
+        return self._query_records(
+            "SELECT * FROM media_items WHERE keeper_status != 'DELETE' "
+            "AND ingestion_status = 'COMPLETE' ORDER BY id"
+        )
+
+    def set_upload_status(
+        self, item_id: int, status: str, cloud_media_id: str | None = None
+    ) -> None:
+        self.conn.execute(
+            "UPDATE media_items SET upload_status = ?, "
+            "cloud_media_id = COALESCE(?, cloud_media_id), updated_at = datetime('now') "
+            "WHERE id = ?",
+            (status, cloud_media_id, item_id),
+        )
+
+    def get_uploaded_item_ids(self) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT id FROM media_items WHERE upload_status = 'UPLOADED'"
+        ).fetchall()
+        return {r["id"] for r in rows}
+
+    def cleanup_summary(self) -> dict:
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN keeper_status = 'DELETE' THEN 1 ELSE 0 END) AS to_delete,
+                SUM(CASE WHEN keeper_status != 'DELETE' THEN 1 ELSE 0 END) AS to_keep,
+                COALESCE(SUM(CASE WHEN keeper_status = 'DELETE' THEN file_size ELSE 0 END), 0)
+                    AS delete_bytes
+            FROM media_items WHERE ingestion_status = 'COMPLETE'
+            """
+        ).fetchone()
+        return dict(row)
+
     # ---- stats -----------------------------------------------------------
     def vision_stats(self) -> dict:
         rows = self.conn.execute(

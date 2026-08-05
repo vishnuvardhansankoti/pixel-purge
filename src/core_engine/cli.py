@@ -146,6 +146,114 @@ def review(
         run_review(db, batch_size=batch_size)
 
 
+@app.command()
+def export(
+    output: Path = typer.Option(Path("manifest.csv"), "--output", "-o", help="CSV output path"),
+    deletions_only: bool = typer.Option(False, "--deletions-only",
+                                        help="Export only items marked DELETE"),
+) -> None:
+    """Export the manifest (or just the deletion set) to CSV."""
+    from .cleanup.export import export_csv, export_deletion_manifest
+
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+        n = (export_deletion_manifest(db, output) if deletions_only
+             else export_csv(db, output))
+    console.print(f"[green]Exported[/green] {n} row(s) to {output}")
+
+
+@app.command()
+def cleanup(
+    strategy: str = typer.Option("export", help="export | stage | clean-slate | browser-auto"),
+    staging_dir: Path = typer.Option(Path("~/pixel-purge-staging").expanduser(),
+                                     help="Where to stage curated keepers"),
+    output: Path = typer.Option(Path("deletions.csv"), "--output", "-o",
+                                help="Deletion manifest path (export strategy)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report only; change nothing"),
+    i_have_a_backup: bool = typer.Option(False, "--i-have-a-backup",
+                                         help="Acknowledge you have a verified backup (clean-slate)"),
+    confirm: str = typer.Option("", "--confirm",
+                                help="Type the confirmation phrase for clean-slate"),
+) -> None:
+    """Execute cleanup. Default 'export' writes a safe deletion manifest.
+
+    Deletion is never performed by the API (Google removed those scopes and never
+    supported media deletion). 'export' is the recommended primary path; 'clean-slate'
+    is a gated last-resort; 'browser-auto' is experimental.
+    """
+    from .cleanup.planner import CONFIRM_PHRASE, clean_slate_allowed, print_plan
+
+    cfg = Config.load()
+    with Database(cfg.db_path) as db:
+        db.init_schema()
+        print_plan(db)
+
+        if strategy == "export":
+            from .cleanup.export import export_deletion_manifest
+
+            n = export_deletion_manifest(db, output)
+            console.print(f"[green]Deletion manifest:[/green] {n} item(s) -> {output}")
+            console.print("Review it, then delete manually in Google Photos, or use "
+                          "[cyan]--strategy browser-auto[/cyan] (experimental).")
+
+        elif strategy == "stage":
+            from .cleanup.curate import stage_keepers
+
+            r = stage_keepers(db, staging_dir, dry_run=dry_run)
+            db.commit()
+            console.print(f"[green]Staged[/green] {r.staged}; metadata restored "
+                          f"{r.metadata_restored}, skipped {r.metadata_skipped}.")
+
+        elif strategy == "clean-slate":
+            if not clean_slate_allowed(confirm, i_have_a_backup):
+                console.print(
+                    "[bold red]Clean-slate is destructive and irreversible.[/bold red]\n"
+                    "It requires BOTH:\n"
+                    "  --i-have-a-backup   (verified independent backup)\n"
+                    f'  --confirm "{CONFIRM_PHRASE}"\n'
+                    "Aborted."
+                )
+                raise typer.Exit(code=1)
+            from .cleanup.curate import stage_keepers
+
+            r = stage_keepers(db, staging_dir, dry_run=dry_run)
+            db.commit()
+            console.print(f"[green]Staged[/green] {r.staged} keeper(s) to {staging_dir}.")
+            console.print("\n[bold red]⚠️  MANUAL STEP:[/bold red] delete all photos at "
+                          "photos.google.com and empty trash, then run "
+                          "[cyan]pixel-purge cleanup --strategy upload[/cyan].")
+
+        elif strategy == "upload":
+            _run_upload(db, staging_dir, dry_run)
+
+        elif strategy == "browser-auto":
+            _run_browser_auto(db)
+
+        else:
+            console.print(f"[red]Unknown strategy:[/red] {strategy}")
+            raise typer.Exit(code=1)
+
+
+def _run_upload(db: Database, staging_dir: Path, dry_run: bool) -> None:
+    if dry_run:
+        console.print(f"[cyan]Dry run:[/cyan] would upload staged files from {staging_dir}")
+        return
+    from .cleanup.google_auth import build_photos_service
+    from .cleanup.uploader import upload_curated_set
+
+    service = build_photos_service()
+    upload_curated_set(db, service, staging_dir)
+
+
+def _run_browser_auto(db: Database) -> None:
+    import asyncio
+
+    from .cleanup.browser_auto import delete_flagged
+
+    asyncio.run(delete_flagged(db))
+
+
 def _print_classify_stats(db: Database) -> None:
     v = db.vision_stats()
     f = db.face_cluster_stats()

@@ -60,6 +60,10 @@ class MediaRecord:
     keyframe_path: str | None = None
     duration_seconds: float | None = None
 
+    # Module D: cleanup / upload
+    upload_status: str | None = None
+    cloud_media_id: str | None = None
+
     # Status
     ingestion_status: str = "PENDING"
     vision_status: str = "PENDING"

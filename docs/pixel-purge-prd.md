@@ -91,8 +91,8 @@ graph TB
 | Data Store | SQLite 3 (WAL mode) with CSV export |
 | Binary Hashing | `hashlib` (SHA-256) |
 | Perceptual Hashing | `imagehash` (pHash) |
-| Vision Model | `Salesforce/blip-image-captioning-base` via `transformers` + PyTorch MPS |
-| Face Detection/Embedding | `face_recognition` (dlib wrapper) |
+| Vision Model | open_clip `ViT-B-32` (`laion2b_s34b_b79k`) zero-shot via PyTorch MPS |
+| Face Detection/Embedding | InsightFace `buffalo_l` via ONNX Runtime (CoreML EP on M-series) |
 | Face Clustering | `scikit-learn` DBSCAN |
 | Video Keyframe | `ffmpeg-python` |
 | Browser Automation | Playwright |
@@ -153,7 +153,7 @@ For video files (`.mp4`, `.mov`, `.avi`, `.mkv`, `.3gp`, `.webm`):
 ffmpeg -i {video_path} -ss 1 -frames:v 1 -q:v 2 {output_dir}/{stem}_keyframe.jpg
 ```
 
-The extracted keyframe is stored alongside the video and used for all subsequent visual analysis (pHash, BLIP, face detection).
+The extracted keyframe is stored alongside the video and used for all subsequent visual analysis (pHash, CLIP, face detection).
 
 #### CLI Interface
 
@@ -416,197 +416,119 @@ pixel-purge dedup --stats
 ### 2.5 Module C: Local AI Vision & Unsupervised Face Clustering
 
 #### Purpose
-Enrich each media item with AI-generated labels (scene/object tags, blur detection, document/screenshot classification) and cluster human faces across the library without manual labeling.
+Enrich each non-duplicate media item with a unified-taxonomy classification (scene/object
+understanding + screenshot/document/blur detection) and cluster human faces across the library
+without manual labeling. All inference is on-device (MPS with CPU fallback); nothing leaves the
+machine.
 
-#### C.1: Object & Scene Tagging (BLIP)
+> [!NOTE]
+> This section reflects the Phase 2 implementation, which supersedes the v1.0 design (BLIP captioning
+> + keyword rules; `face_recognition`/dlib). Rationale is tracked as findings **[H2]** and **[H4]**
+> in [`pixel-purge-prd-review.md`](./pixel-purge-prd-review.md): CLIP zero-shot gives taxonomy parity
+> with the Module E delta classifier and avoids brittle caption-keyword matching; InsightFace
+> installs cleanly on Apple Silicon (dlib has no MPS backend) and is more accurate.
 
-**Model:** `Salesforce/blip-image-captioning-base` (224M parameters)
-**Backend:** PyTorch with MPS (Metal Performance Shaders) on Apple Silicon
-**Fallback:** CPU inference if MPS unavailable
+#### C.1: Vision Classification (CLIP zero-shot)
 
-```python
-def run_blip_captioning(db: Database, device: str = 'auto'):
-    """Generate AI captions and derive classification labels."""
+**Model:** open_clip `ViT-B-32` (`laion2b_s34b_b79k`), lazy-loaded via the `[vision]` extra
+**Backend:** PyTorch, device auto-detect (`mps` → `cpu`)
+**Taxonomy:** the four unified buckets shared with Module E — `ADHOC_PURGE`, `TRIP`, `FAMILY_KEEP`,
+`OTHER` (`vision/taxonomy.py`).
 
-    # Auto-detect best device
-    if device == 'auto':
-        if torch.backends.mps.is_available():
-            device = 'mps'
-        elif torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
+CLIP scores each image against a set of natural-language label prompts (each mapped to one bucket),
+which is far more robust than captioning-then-keyword-matching and yields a per-bucket confidence for
+free. The result is then fused with two cheap **pure-numpy** quality signals (no OpenCV), so blur and
+text-density are real and unit-testable:
 
-    processor = BlipProcessor.from_pretrained(
-        "Salesforce/blip-image-captioning-base")
-    model = BlipForConditionalGeneration.from_pretrained(
-        "Salesforce/blip-image-captioning-base").to(device)
-
-    items = db.get_items_without_caption()
-
-    with Progress() as progress:
-        task = progress.add_task("AI captioning...", total=len(items))
-
-        for item in items:
-            img_path = item.keyframe_path or item.local_path
-            try:
-                image = Image.open(img_path).convert('RGB')
-
-                # Generate caption
-                inputs = processor(image, return_tensors="pt").to(device)
-                output = model.generate(**inputs, max_new_tokens=50)
-                caption = processor.decode(output[0], skip_special_tokens=True)
-
-                # Derive classification signals
-                label = classify_from_caption(caption, image)
-
-                db.update_ai_label(item.id,
-                                   ai_caption=caption,
-                                   ai_label=label.category,
-                                   blur_score=label.blur_score,
-                                   ocr_text_ratio=label.ocr_ratio)
-            except Exception as e:
-                db.update_ai_label(item.id, ai_label='ERROR',
-                                   error_message=str(e))
-
-            progress.advance(task)
-
-
-def classify_from_caption(caption: str, image: Image) -> ClassificationResult:
-    """Rule-based classification from BLIP caption + image analysis."""
-    caption_lower = caption.lower()
-
-    # Blur detection via Laplacian variance
-    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    # OCR text density estimation (ratio of text-like regions)
-    ocr_ratio = estimate_text_density(gray)
-
-    # Classification rules
-    if ocr_ratio > 0.30:
-        category = 'SCREENSHOT_OR_DOCUMENT'
-    elif blur_score < 50:
-        category = 'BLURRY'
-    elif any(kw in caption_lower for kw in ['receipt', 'bill', 'invoice',
-                                              'menu', 'ticket']):
-        category = 'RECEIPT_OR_DOCUMENT'
-    elif any(kw in caption_lower for kw in ['person', 'man', 'woman', 'child',
-                                              'people', 'group', 'family',
-                                              'couple', 'baby']):
-        category = 'PEOPLE'
-    elif any(kw in caption_lower for kw in ['landscape', 'mountain', 'beach',
-                                              'sunset', 'building', 'city',
-                                              'street', 'park']):
-        category = 'SCENIC'
-    elif any(kw in caption_lower for kw in ['food', 'meal', 'dish', 'plate',
-                                              'restaurant', 'coffee']):
-        category = 'FOOD'
-    elif any(kw in caption_lower for kw in ['dog', 'cat', 'pet', 'animal']):
-        category = 'PETS'
-    else:
-        category = 'OTHER'
-
-    return ClassificationResult(category=category, blur_score=blur_score,
-                                 ocr_ratio=ocr_ratio)
-```
-
-#### C.2: Human Face Clustering (face_recognition + DBSCAN)
-
-**Embedding Extraction:** `face_recognition` library (dlib 128-dimensional face encodings)
-**Clustering:** `scikit-learn` DBSCAN with `eps=0.55`, `min_samples=3`
-**Scope:** Solo photos, group photos — all detected faces are embedded and clustered
+- **`blur_score`** — variance of a 3×3 Laplacian convolution. Low variance ⇒ few sharp edges ⇒ blurry
+  (threshold 50).
+- **`text_density`** — fraction of pixels whose normalized `|Laplacian|` exceeds a fixed cutoff. High,
+  evenly-spread edges ⇒ screenshot/document (threshold 0.30). A cheap proxy for "text-heavy", not real
+  OCR.
 
 ```python
-def run_face_clustering(db: Database, eps: float = 0.55, min_samples: int = 3):
-    """Extract face embeddings and cluster into person groups."""
+# vision/clip_tagger.py — pure, testable decision logic (model-free)
+def fuse_classification(prompt_probs: dict[str, float], blur: float,
+                        density: float) -> ClassificationResult:
+    # Aggregate CLIP prompt probabilities to bucket level for a stable confidence.
+    bucket_prob = {b: 0.0 for b in BUCKETS}
+    for p, prob in prompt_probs.items():
+        bucket_prob[prompt_bucket(p)] += prob
+    top = max(prompt_probs, key=prompt_probs.get)
+    clip_bucket, clip_label = prompt_bucket(top), prompt_label(top)
 
-    items = db.get_items_without_face_data()
-    all_embeddings = []
-    embedding_to_item = []  # Maps embedding index -> (item_id, face_index)
-
-    # Phase 1: Extract face embeddings
-    with Progress() as progress:
-        task = progress.add_task("Detecting faces...", total=len(items))
-
-        for item in items:
-            img_path = item.keyframe_path or item.local_path
-            try:
-                image = face_recognition.load_image_file(img_path)
-                face_locations = face_recognition.face_locations(image,
-                                                                 model='hog')
-                face_encodings = face_recognition.face_encodings(image,
-                                                                  face_locations)
-
-                db.update_face_count(item.id, len(face_locations))
-
-                for idx, encoding in enumerate(face_encodings):
-                    all_embeddings.append(encoding)
-                    embedding_to_item.append((item.id, idx))
-
-            except Exception as e:
-                db.update_face_count(item.id, face_count=0,
-                                      error_message=str(e))
-
-            progress.advance(task)
-
-    if not all_embeddings:
-        return
-
-    # Phase 2: DBSCAN clustering
-    embeddings_matrix = np.array(all_embeddings)
-    clustering = DBSCAN(eps=eps, min_samples=min_samples,
-                        metric='euclidean', n_jobs=-1)
-    labels = clustering.fit_predict(embeddings_matrix)
-
-    # Phase 3: Assign person_cluster_id to items
-    for idx, (item_id, face_idx) in enumerate(embedding_to_item):
-        cluster_label = labels[idx]
-        if cluster_label == -1:
-            cluster_id = None  # Noise / unrecognized face
-        else:
-            cluster_id = f"person_{cluster_label:04d}"
-        db.add_face_cluster(item_id, face_index=face_idx,
-                            person_cluster_id=cluster_id,
-                            embedding=all_embeddings[idx].tobytes())
-
-    n_clusters = len(set(labels) - {-1})
-    n_noise = list(labels).count(-1)
-    console.print(f"[green]Clustered {len(all_embeddings)} faces into "
-                  f"{n_clusters} person groups ({n_noise} unclustered)[/green]")
+    # Override 1: text-heavy (screenshot/document) beats the CLIP subject.
+    if is_text_heavy(density):
+        return ClassificationResult(ADHOC_PURGE, max(bucket_prob[clip_bucket], density),
+                                    "text_heavy", ..., blur, density)
+    # Override 2: blurry — unless CLIP is confident this is a family/person shot.
+    if is_blurry(blur) and not (clip_bucket == FAMILY_KEEP and prompt_probs[top] > 0.5):
+        return ClassificationResult(ADHOC_PURGE, max(0.5, bucket_prob[clip_bucket]),
+                                    "blurry", ..., blur, density)
+    return ClassificationResult(clip_bucket, bucket_prob[clip_bucket], clip_label, ..., blur, density)
 ```
+
+Each item's `classification_bucket`, `classification_confidence`, `classification_reasoning`,
+`ai_label`, `blur_score`, and `ocr_text_ratio` are written to the manifest; `vision_status` gates
+resume. **Vision only labels — it never deletes.** Purge candidates surface in review (§2.6, TUI) and
+the dashboard (§2.8).
+
+#### C.2: Human Face Clustering (InsightFace + DBSCAN)
+
+**Embedding:** InsightFace `buffalo_l` (512-d, L2-normalized) via ONNX Runtime, lazy-loaded via the
+`[faces]` extra. On Apple Silicon it uses the **CoreML execution provider** (falls back to CPU).
+**Clustering:** `scikit-learn` DBSCAN, `metric='cosine'`, `eps=0.45`, **`min_samples=2`**.
+
+`min_samples=2` (not 3) so a person appearing in only two photos still forms a cluster instead of
+being discarded as noise — important for personal libraries **[H4]**.
+
+```python
+# vision/faces.py
+def run_face_clustering(db, eps=0.45, min_samples=2):
+    analyzer = InsightFaceAnalyzer()          # buffalo_l, CoreML EP on M-series
+    extract_faces(db, analyzer)               # -> face_embeddings (embedding blob + bbox)
+
+    rows = db.get_all_face_embeddings()
+    matrix = np.vstack([embedding_from_bytes(r["embedding"]) for r in rows])
+    labels = cluster_faces(matrix, eps=eps, min_samples=min_samples)  # DBSCAN, cosine
+    assign_person_clusters(db, rows, labels)  # person_XXXX ids; -1 -> unclustered (None)
+```
+
+Faces are stored in the normalized `face_embeddings` table (512-d float32 blob, plus bounding box);
+`person_cluster_id` is assigned per face and aggregated onto `media_items.person_cluster_ids` (JSON).
+`face_status` gates resume.
 
 #### CLI Interface
 
 ```bash
-# Run full vision + face clustering pipeline
+# Full vision + face clustering pipeline
 pixel-purge classify
 
-# Run only BLIP captioning
+# Only one stage
 pixel-purge classify --vision-only
-
-# Run only face clustering
 pixel-purge classify --faces-only
 
 # Custom DBSCAN parameters
-pixel-purge classify --faces-only --eps 0.50 --min-samples 5
+pixel-purge classify --faces-only --eps 0.50 --min-samples 3
 
-# Show classification statistics
+# Statistics (works with no ML deps installed)
 pixel-purge classify --stats
-
-# Resume interrupted classification
-pixel-purge classify --resume
 ```
 
 #### Expected Performance (M1 Max, 20K items)
 
-| Operation | Per-Item Time | Estimated Total |
+| Operation | Notes | Estimated Total |
 |---|---|---|
-| BLIP Captioning (MPS) | ~0.1s | ~33 minutes |
-| Face Detection (HOG) | ~0.15s | ~50 minutes |
-| Face Embedding (dlib) | ~0.05s/face | ~15 minutes |
-| DBSCAN Clustering | — | ~10 seconds |
-| **Total** | | **~1.5 hours** |
+| CLIP classification (MPS) | batched image encode | ~20–35 minutes |
+| Face detect + embed (InsightFace, CoreML) | | ~30–50 minutes |
+| DBSCAN clustering | | ~seconds |
+| **Total** | | **~1 hour** |
+
+> [!NOTE]
+> The `[vision]`/`[faces]` extras (torch, open_clip, insightface, onnxruntime, scikit-learn) are only
+> needed to *run* `classify`. The rest of the CLI and the entire test suite work without them, because
+> the model layers are lazy-imported and the decision/clustering logic is unit-tested with mocked
+> embeddings.
 
 ---
 
@@ -1105,7 +1027,7 @@ CREATE TABLE IF NOT EXISTS media_items (
     hamming_distance      INTEGER,
 
     -- Module C: AI Vision
-    ai_caption            TEXT,           -- BLIP-generated caption
+    ai_caption            TEXT,           -- Top CLIP label prompt
     ai_label              TEXT,           -- Derived classification label
     blur_score            REAL,           -- Laplacian variance
     ocr_text_ratio        REAL,          -- Estimated text density (0.0-1.0)
@@ -1199,9 +1121,9 @@ time_window_minutes = 30
 hamming_threshold = 10
 
 [vision]
-model = "Salesforce/blip-image-captioning-base"
-device = "auto"  # auto, mps, cuda, cpu
-batch_size = 1
+model = "ViT-B-32"  # open_clip zero-shot
+device = "auto"  # auto, mps, cpu
+# batching handled internally
 
 [face_clustering]
 eps = 0.55
@@ -1243,7 +1165,7 @@ The `pixel-purge export` command generates a CSV with the following columns:
 | `is_duplicate` | boolean | NO | Whether flagged as duplicate |
 | `duplicate_of` | string | YES | Filename of the keeper item |
 | `dedup_tier` | string | YES | `EXACT_HASH` or `VISUAL_PHASH` |
-| `ai_caption` | string | YES | BLIP-generated caption |
+| `ai_caption` | string | YES | Top CLIP label prompt |
 | `ai_label` | string | YES | Classification label |
 | `blur_score` | float | YES | Laplacian variance (higher = sharper) |
 | `ocr_text_ratio` | float | YES | Text density ratio (0.0–1.0) |
@@ -1263,7 +1185,7 @@ The `pixel-purge export` command generates a CSV with the following columns:
 | Ingestion + Metadata Merge | 10 minutes | 30 minutes |
 | Tier 1 Dedup (SHA-256) | 5 minutes | 15 minutes |
 | Tier 2+3 Dedup (Spatial + pHash) | 15 minutes | 45 minutes |
-| BLIP Captioning (MPS) | 33 minutes | 60 minutes |
+| CLIP classification (MPS) | 30 minutes | 60 minutes |
 | Face Detection + Clustering | 65 minutes | 120 minutes |
 | Re-upload to Google Photos | 4 hours | 8 hours |
 | **Total Batch Phase** | **~6 hours** | **~12 hours** |
@@ -1273,7 +1195,7 @@ The `pixel-purge export` command generates a CSV with the following columns:
 
 | Requirement | Implementation |
 |---|---|
-| All ML inference runs locally | BLIP/CLIP, face embedding, pHash execute on-device — batch **and** delta phases; no images or metadata sent to any third-party API |
+| All ML inference runs locally | CLIP, face embedding, pHash execute on-device — batch **and** delta phases; no images or metadata sent to any third-party API |
 | OAuth tokens encrypted at rest | Stored via macOS Keychain (`keyring` library) or encrypted JSON |
 | No telemetry or analytics | Zero data collection; Modules A–C, E, and F are fully offline-capable |
 | Dashboard is local-only | Served on `localhost`; no auth provider, no hosted data store; the OS user boundary is the security boundary |
@@ -1312,7 +1234,7 @@ account is required**.
 | Google Photos API rate limiting (429) | Exponential backoff: 1s → 2s → 4s → 8s → 16s → 32s → fail after 6 retries. |
 | Google Photos API quota exhaustion | Pause and retry after quota reset (midnight Pacific). Log pause duration. |
 | Face detection failure (bad image) | Set `face_count = 0`, `face_status = 'ERROR'`; continue. |
-| BLIP model OOM on MPS | Catch `RuntimeError`, fall back to CPU inference for that item. |
+| Vision (CLIP) model OOM on MPS | Catch `RuntimeError`, fall back to CPU inference for that item. |
 | Video keyframe extraction failure | Skip visual analysis for that video; hash dedup still applies. |
 | SQLite lock contention | WAL mode enabled; 30-second busy timeout. |
 | Network failure during upload | Checkpoint after each successful batch; resume from last checkpoint. |
@@ -1337,7 +1259,7 @@ gantt
     Unit tests & fixtures             :p1d, after p1c, 3d
 
     section Phase 2
-    Module C: BLIP Vision Tagging     :p2a, after p1d, 4d
+    Module C: CLIP Vision Tagging     :p2a, after p1d, 4d
     Module C: Face Clustering         :p2b, after p2a, 4d
     TUI Review Interface              :p2c, after p2b, 3d
     Integration tests                 :p2d, after p2c, 2d
@@ -1402,9 +1324,10 @@ pixel-purge/
 │   │   │   └── visual_dedup.py    # Module B: Tier 3 pHash
 │   │   ├── vision/
 │   │   │   ├── __init__.py
-│   │   │   ├── blip_tagger.py     # Module C: BLIP captioning
-│   │   │   ├── face_cluster.py    # Module C: face_recognition + DBSCAN
-│   │   │   └── blur_detect.py     # Module C: blur / OCR detection
+│   │   │   ├── taxonomy.py        # Module C: unified taxonomy + CLIP prompts
+│   │   │   ├── clip_tagger.py     # Module C: CLIP zero-shot + rule fusion
+│   │   │   ├── quality.py         # Module C: numpy blur + text-density
+│   │   │   └── faces.py           # Module C: InsightFace + DBSCAN
 │   │   ├── cleanup/
 │   │   │   ├── __init__.py
 │   │   │   ├── clean_slate.py     # Module D: Strategy 1
@@ -1467,8 +1390,11 @@ pixel-purge/
 │   ├── test_hash_dedup.py
 │   ├── test_spatial_bucket.py
 │   ├── test_visual_dedup.py
-│   ├── test_blip_tagger.py
-│   ├── test_face_cluster.py
+│   ├── test_quality.py
+│   ├── test_clip_fusion.py
+│   ├── test_faces_cluster.py
+│   ├── test_cleanup.py
+│   ├── test_review.py
 │   ├── test_delta_classify.py
 │   ├── test_dashboard_server.py
 │   └── test_database.py
@@ -1483,11 +1409,11 @@ pixel-purge/
 
 | Milestone | Description | Acceptance Criteria |
 |---|---|---|
-| **P2.1** BLIP Integration | Module C.1: Vision transformer captioning with MPS acceleration | Correct captions generated for test images; MPS → CPU fallback verified |
-| **P2.2** Classification Rules | Caption → label derivation (screenshot, receipt, blurry, people, scenic) | ≥90% accuracy on labeled test set |
-| **P2.3** Blur + OCR Detection | OpenCV Laplacian variance + text density estimation | Blurry images scored < 50; screenshots have OCR ratio > 0.30 |
-| **P2.4** Face Embedding | `face_recognition` 128-dim encoding extraction | Correct face count on test images; embeddings stored in DB |
-| **P2.5** DBSCAN Clustering | Unsupervised face grouping with configurable eps | Same person clustered together across test images; different people separated |
+| **P2.1** CLIP Integration | Module C.1: open_clip `ViT-B-32` zero-shot into the unified taxonomy, MPS acceleration | Correct buckets on test images; MPS → CPU fallback verified |
+| **P2.2** Rule Fusion | CLIP + blur/text-density fusion (`fuse_classification`) into ADHOC_PURGE/TRIP/FAMILY_KEEP/OTHER | Deterministic overrides verified in `test_clip_fusion.py`; ≥90% target pending a labeled eval set [H2] |
+| **P2.3** Blur + Text Detection | Pure-numpy Laplacian variance + edge-fraction text density | Blurry images scored < 50; documents text-density > 0.30 (tested in `test_quality.py`) |
+| **P2.4** Face Embedding | InsightFace `buffalo_l` 512-dim embeddings via ONNX Runtime (CoreML EP) | Faces detected + embeddings stored in `face_embeddings` |
+| **P2.5** DBSCAN Clustering | Unsupervised face grouping, cosine, `min_samples=2` [H4] | Same person clustered (incl. 2-photo people); different people separated |
 | **P2.6** TUI Review | Rich interactive table for batch review of flagged items | User can approve/reject batches; changes persisted to DB |
 
 ### 5.4 Phase 3: Web Automation / Cleanup Execution Module
